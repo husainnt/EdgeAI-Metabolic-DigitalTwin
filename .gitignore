@@ -1,0 +1,19 @@
+# Ignore the official team deployment folder to prevent nested Git conflicts
+glycemic_twin/
+glycemic-twin-edge/
+
+# Ignore massive simulation results and dataset folders (keep GitHub light!)
+*.csv
+SIM-GLUCOSE/results/
+results/
+AI-READI-DATA/
+*.tsv
+*.json
+
+# Ignore local python cache files
+**/__pycache__/
+**/*.pyc
+
+# Ignore temporary environment or runner files
+.vscode/
+tempCodeRunnerFile.py
