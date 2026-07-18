@@ -84,7 +84,7 @@ def run_simulation(vmx_scale, kp3_scale, sim_days=3, seed=1):
 # ensure the results directory exists
 os.makedirs("results", exist_ok=True)
 
-# here i define the extended test matrix sweep bounds
+# here i define the new extended test matrix sweep bounds
 vmx_scales = [0.60, 0.65, 0.70, 0.75]
 kp3_scales = [0.55, 0.60, 0.65, 0.70]
 
@@ -102,7 +102,7 @@ for vmx, kp3 in itertools.product(vmx_scales, kp3_scales):
     time_above_180 = (results["BG"] > 180).mean() * 100
     time_below_70 = (results["BG"] < 70).mean() * 100
     
-    print(f"Vmx: {vmx:.2f} | kp3: {keep_metric: .2f} -> Fasting Mean: {fasting_mean:.1f}, Peak: {peak:.1f}, TIR%: {time_in_range:.1f}, Hypo%: {time_below_70:.1f}")
+    print(f"Vmx scale: {vmx:.2f} | kp3 scale: {kp3:.2f} -> Fasting Mean: {fasting_mean:.1f}, Peak: {peak:.1f}, TIR%: {time_in_range:.1f}, Hypo%: {time_below_70:.1f}")
     
     sweep_results[key] = {
         "vmx_scale": vmx,
@@ -114,7 +114,6 @@ for vmx, kp3 in itertools.product(vmx_scales, kp3_scales):
         "time_below_70_pct": round(time_below_70, 2)
     }
 
-# here i save the data to a unique extended filename to avoid overwriting
 with open("results/t2d_parameter_sweep_extended_summary.json", "w") as f:
     json.dump(sweep_results, f, indent=2)
 
