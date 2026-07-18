@@ -1,0 +1,12 @@
+{
+  "vmx_scale": 0.75,
+  "kp3_scale": 0.7,
+  "controller_kp": 0.0005,
+  "controller_max_secretion_U_min": 0.05,
+  "controller_basal_rate_U_min": 0.02112,
+  "fasting_bg_mean": 168.37,
+  "postmeal_peak": 241.74,
+  "time_in_range_pct": 62.11,
+  "time_above_180_pct": 37.89,
+  "time_below_70_pct": 0.0
+}
