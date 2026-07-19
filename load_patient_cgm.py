@@ -2,53 +2,44 @@ import os
 import json
 import pandas as pd
 
-# here i define the local path to the root dataset folder
-dataset_path = r"F:\FYP\aireadi_data\aireadi-data\d0665d3d-1439-4627-b1c0-e0f2cbed8ebc\dataset"
-bg_manifest_path = os.path.join(dataset_path, "wearable_blood_glucose", "manifest.tsv")
+# absolute dataset directory configurations
+base_dataset_dir = r"F:\FYP\aireadi_data\aireadi-data\d0665d3d-1439-4627-b1c0-e0f2cbed8ebc\dataset"
+manifest_path = os.path.join(base_dataset_dir, "wearable_blood_glucose", "manifest.tsv")
 
-print("=== TASK 6: CANONICAL PATIENT 1027 INITIALIZATION ===")
+print("=== OPEN mHEALTH DEEP SCHEMA INSPECTION ===")
 
-# here i read the blood glucose manifest index
-manifest_df = pd.read_csv(bg_manifest_path, sep="\t")
-patient_bg_info = manifest_df[manifest_df["person_id"] == 1027]
+# load manifest data framework
+manifest_df = pd.read_csv(manifest_path, sep="\t")
+patient_row = manifest_df[manifest_df["person_id"] == 1027]
 
-if not patient_bg_info.empty:
-    # here i resolve the absolute file path for the cgm file
-    rel_path = patient_bg_info["glucose_filepath"].values[0].lstrip("/").replace("/", os.sep)
-    abs_bg_path = os.path.join(dataset_path, rel_path)
-    
-    if os.path.exists(abs_bg_path):
-        # here i open and parse the raw json data structure
-        with open(abs_bg_path, "r") as f:
-            raw_json = json.load(f)
-            
-        print(f"[SUCCESS] Loaded raw glucose file. Parsing records...")
+# resolve target absolute json filepath
+relative_path = patient_row["glucose_filepath"].values[0].lstrip("/")
+full_path = os.path.join(base_dataset_dir, relative_path.replace("/", os.sep))
+
+if os.path.exists(full_path):
+    with open(full_path, "r") as f:
+        data = json.load(f)
         
-        # here i normalize the nested json arrays into a structured pandas dataframe
-        # note: checking for common bids keys or a flat list configuration
-        if isinstance(raw_json, dict) and "data" in raw_json:
-            cgm_df = pd.DataFrame(raw_json["data"])
-        elif isinstance(raw_json, list):
-            cgm_df = pd.DataFrame(raw_json)
-        else:
-            # fallback if the data is keyed directly under patient metadata attributes
-            cgm_df = pd.DataFrame(raw_json)
-            
-        print("\n=== Raw Dataframe Columns Found ===")
-        print(cgm_df.columns.tolist())
-        print(f"Total rows extracted: {len(cgm_df)}")
-        print("\n=== Data Preview ===")
-        print(cgm_df.head(5))
+    print("\n=== TOP LEVEL CONTAINER STRUCTURE ===")
+    if isinstance(data, dict):
+        print(f"Container Type: Dictionary | Top-level Keys: {list(data.keys())}")
         
-        # --- VERIFYING COMPANION WEARABLE PATHS ---
-        print("\n" + "="*50 + "\n=== VERIFYING FUSION MODALITIES CONVENTION ===")
-        hr_path = os.path.join(dataset_path, "wearable_activity_monitor", "heart_rate", "garmin_vivosmart5", "1027")
-        activity_path = os.path.join(dataset_path, "wearable_activity_monitor", "physical_activity", "garmin_vivosmart5", "1027")
+        print("\n=== ENVELOPE HEADER SNAPSHOT ===")
+        print(json.dumps(data.get("header", {}), indent=2)[:400])
         
-        print(f"Heart Rate Subfolder Exists: {os.path.exists(hr_path)}")
-        print(f"Physical Activity Subfolder Exists: {os.path.exists(activity_path)}")
-        
+        print("\n=== TELEMETRY BODY PAYLOAD ANALYSIS ===")
+        body = data.get("body", {})
+        if isinstance(body, dict):
+            print(f"Body Key-Value Schema: {list(body.keys())}")
+            for key, val in body.items():
+                print(f"\n Inspecting Key '{key}' (Data Type: {type(val)}):")
+                print(json.dumps(val, indent=2)[:800])
+                print("... [Truncated for readability] ...")
+        elif isinstance(body, list):
+            print(f"Body is directly formatted as a List array of length: {len(body)}")
+            print(json.dumps(body[:2], indent=2))
     else:
-        print(f"[ERROR] Glucose data file missing at: {abs_bg_path}")
+        print(f"Container Type: Flat List | Total Element Count: {len(data)}")
+        print(json.dumps(data[:2], indent=2))
 else:
-    print("[ERROR] Patient 1027 row entry missing from glucose manifest index.")
+    print(f"[ERROR] Could not locate file at target path: {full_path}")
