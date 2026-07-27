@@ -1,11 +1,12 @@
 """
-True CGM-Free Multimodal Evaluation — Patient 1031
---------------------------------------------------
+True CGM-Free Multimodal Convergence Evaluation — Patient 1031 (100 Epochs)
+---------------------------------------------------------------------------
 Strictly enforces the sparse-calibration deployment scenario:
-- NO continuous CGM history is fed into the model.
+- NO continuous CGM history fed to the model.
 - Continuous Sequence Input: 60 minutes of real Garmin HR telemetry ONLY.
 - Calibration Context Input: Last known fingerstick value (G_calib) + time elapsed (dt).
-- Baseline: Forward-filled fingerstick value (simulating open-loop drift).
+- Baseline: Forward-filled fingerstick value (open-loop drift estimate).
+- Training: 100 Epochs + CosineAnnealingLR for full convergence check.
 """
 
 import os
@@ -17,6 +18,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
+# Set deterministic random seeds
 torch.manual_seed(42)
 np.random.seed(42)
 
@@ -24,6 +26,7 @@ CSV_PATH = "results/patient_1031_real_cgm_with_hr.csv"
 if not os.path.exists(CSV_PATH):
     raise FileNotFoundError(f"Could not find {CSV_PATH}. Run merge script first.")
 
+# Step 1: Load aligned patient dataset
 df = pd.read_csv(CSV_PATH)
 df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None)
 df = df.sort_values("timestamp").reset_index(drop=True)
@@ -41,7 +44,7 @@ df["date_str"] = df["timestamp"].dt.strftime("%Y-%m-%d")
 LOOKBACK = 12  # 60 mins of Garmin HR history
 HORIZON = 6   # 30 mins ahead forecast
 
-# Extract 2x/day sparse calibration points (~8:00 AM & 8:00 PM)
+# Step 2: Extract 2x/day sparse calibration points (~8:00 AM & 8:00 PM)
 calibration_indices = set()
 for date_str, group in df.groupby("date_str"):
     for target_hour in [8, 20]:
@@ -54,7 +57,7 @@ for date_str, group in df.groupby("date_str"):
 calibration_indices = sorted(list(calibration_indices))
 print(f"Extracted {len(calibration_indices)} real sparse fingerstick calibration points (~8am/8pm)")
 
-# Compute sparse open-loop state (Forward-filled fingerstick + elapsed time)
+# Step 3: Compute sparse open-loop state (Forward-filled fingerstick + elapsed time)
 time_since_calib_series = np.zeros(len(glucose), dtype=np.float32)
 calib_val_series = np.zeros(len(glucose), dtype=np.float32)
 last_val, tsc = glucose[0], 0.0
@@ -68,7 +71,7 @@ for i in range(len(glucose)):
     time_since_calib_series[i] = tsc
     calib_val_series[i] = last_val
 
-# Construct Dataset Windows WITHOUT Continuous Glucose Sequence
+# Step 4: Construct Dataset Windows WITHOUT Continuous Glucose Sequence
 X_hr_seq, y_real, y_base, tsc_arr, calib_arr = [], [], [], [], []
 
 for i in range(LOOKBACK, len(glucose) - HORIZON):
@@ -90,7 +93,7 @@ y_base = np.array(y_base, dtype=np.float32)
 tsc_arr = np.array(tsc_arr, dtype=np.float32)
 calib_arr = np.array(calib_arr, dtype=np.float32)
 
-# Train/Test Split (70% Train / 30% Test chronologically)
+# Step 5: Chronological Train/Test Split (70% Train / 30% Test)
 split_idx = int(len(X_hr_seq) * 0.7)
 
 X_hr_train, X_hr_test = X_hr_seq[:split_idx], X_hr_seq[split_idx:]
@@ -99,20 +102,23 @@ y_base_train, y_base_test = y_base[:split_idx], y_base[split_idx:]
 tsc_train, tsc_test = tsc_arr[:split_idx], tsc_arr[split_idx:]
 calibval_train, calibval_test = calib_arr[:split_idx], calib_arr[split_idx:]
 
-# Feature Normalization
+# Step 6: Feature Normalization
 hr_mean, hr_std = X_hr_train.mean(), X_hr_train.std() + 1e-6
 X_hr_tr_n = (X_hr_train - hr_mean) / hr_std
 X_hr_te_n = (X_hr_test - hr_mean) / hr_std
 
 tsc_mean, tsc_std = tsc_train.mean(), tsc_train.std() + 1e-6
-tsc_tr_n, tsc_te_n = (tsc_train - tsc_mean) / tsc_std, (tsc_test - tsc_mean) / tsc_std
+tsc_tr_n = (tsc_train - tsc_mean) / tsc_std
+tsc_te_n = (tsc_test - tsc_mean) / tsc_std
 
 cv_mean, cv_std = calibval_train.mean(), calibval_train.std() + 1e-6
-cv_tr_n, cv_te_n = (calibval_train - cv_mean) / cv_std, (calibval_test - cv_mean) / cv_std
+cv_tr_n = (calibval_train - cv_mean) / cv_std
+cv_te_n = (calibval_test - cv_mean) / cv_std
 
 # Target for ML head: Residual error between real glucose and forward-filled fingerstick
 y_train_residual = y_real_train - y_base_train
 
+# Step 7: PyTorch Dataset & Model Definitions
 class TrueSparseMultimodalDataset(Dataset):
     def __init__(self, X_hr, tsc, calibval, y):
         self.X_hr = torch.tensor(X_hr, dtype=torch.float32)
@@ -151,15 +157,17 @@ loader = DataLoader(
     batch_size=32, shuffle=True
 )
 
+# Step 8: Training Loop with Cosine Learning Rate Scheduler (100 Epochs)
+EPOCHS = 100
 model = TrueSparseMultimodalLSTM(hidden_dim=16)
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 loss_fn = nn.MSELoss()
 
-print("\nTraining True CGM-Free Multimodal Model (Garmin HR + Sparse Fingerstick Context)...")
+print("\nTraining True CGM-Free Multimodal Model for 100 Epochs (Convergence Test)...")
 print("=" * 85)
 
 model.train()
-EPOCHS = 40
 for epoch in range(1, EPOCHS + 1):
     epoch_loss = 0.0
     for xb_hr, tscb, cvb, yb in loader:
@@ -169,10 +177,15 @@ for epoch in range(1, EPOCHS + 1):
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
+    
+    scheduler.step()
+    
     if epoch % 10 == 0:
-        print(f"Epoch {epoch:02d}/{EPOCHS} | Train MSE Loss: {epoch_loss/len(loader):.2f}")
+        avg_loss = epoch_loss / len(loader)
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch:03d}/{EPOCHS} | Train MSE Loss: {avg_loss:.2f} | LR: {current_lr:.6f}")
 
-# Evaluation on Held-Out Test Set
+# Step 9: Evaluation on Held-Out Test Set
 model.eval()
 with torch.no_grad():
     X_hr_test_t = torch.tensor(X_hr_te_n, dtype=torch.float32)
@@ -189,14 +202,14 @@ mae_hyb = np.mean(np.abs(y_real_test - pred_final))
 improvement_pct = ((rmse_base - rmse_hyb) / rmse_base) * 100
 
 print("=" * 85)
-print(f"HONEST CGM-FREE RESULTS: 2x/day Fingerstick + Continuous Garmin HR ({actual_days:.1f} Days)")
+print(f"CONVERGED CGM-FREE RESULTS (100 Epochs): Patient 1031 ({actual_days:.1f} Days Total)")
 print("=" * 85)
 print(f"  • Open-Loop Baseline RMSE (Forward-filled Fingerstick): {rmse_base:.2f} mg/dL | MAE: {mae_base:.2f} mg/dL")
 print(f"  • Hybrid Model RMSE (Fingerstick + Real Garmin HR):      {rmse_hyb:.2f} mg/dL | MAE: {mae_hyb:.2f} mg/dL")
 print(f"  • Honest RMSE Improvement:                               {improvement_pct:+.1f}%")
 print("=" * 85)
 
-# Save Diagnostic Plot
+# Step 10: Save Diagnostic Plot
 os.makedirs("results", exist_ok=True)
 plt.figure(figsize=(14, 6))
 plot_n = min(300, len(y_real_test))
@@ -205,8 +218,8 @@ plt.plot(y_base_test[:plot_n], label="Open-Loop Baseline (Fingerstick alone)", c
 plt.plot(pred_final[:plot_n], label="Hybrid Model (Fingerstick + Garmin HR)", color="green", alpha=0.85)
 plt.xlabel("Test Sample Index (Chronological)")
 plt.ylabel("Glucose (mg/dL)")
-plt.title(f"True CGM-Free Evaluation — Patient 1031 (First {plot_n} Test Points)")
+plt.title(f"Converged CGM-Free Evaluation — Patient 1031 (First {plot_n} Test Points)")
 plt.legend()
 plt.tight_layout()
-plt.savefig("results/true_sparse_multimodal_eval.png", dpi=120)
-print("[SAVED] Diagnostic plot: results/true_sparse_multimodal_eval.png")
+plt.savefig("results/true_sparse_multimodal_eval_converged.png", dpi=120)
+print("[SAVED] Diagnostic plot: results/true_sparse_multimodal_eval_converged.png")
