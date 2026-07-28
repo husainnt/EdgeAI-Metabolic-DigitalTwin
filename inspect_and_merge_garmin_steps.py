@@ -9,14 +9,10 @@ import pandas as pd
 import numpy as np
 
 ACTIVITY_FILE = r"F:\FYP\aireadi_data\aireadi-data\d0665d3d-1439-4627-b1c0-e0f2cbed8ebc\dataset\wearable_activity_monitor\physical_activity\garmin_vivosmart5\1031\1031_activity.json"
-CGM_HR_FILE = "results/patient_1031_real_cgm_with_hr.csv"  # Correct path in results/
+CGM_HR_FILE = "results/patient_1031_real_cgm_with_hr.csv"
 
 
 def parse_garmin_activity(json_path):
-    """
-    Parses OpenmHealth formatted activity JSON for Patient 1031.
-    Extracts timestamps and step counts from base_movement_quantity.
-    """
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"File not found: {json_path}")
 
@@ -53,9 +49,6 @@ def parse_garmin_activity(json_path):
 
 
 def analyze_and_deduplicate(df):
-    """
-    Checks for exact timestamp duplicates and removes redundant overlap records.
-    """
     total_raw = len(df)
     duplicate_mask = df.duplicated(subset=["timestamp"], keep=False)
     num_duplicates = duplicate_mask.sum()
@@ -64,7 +57,6 @@ def analyze_and_deduplicate(df):
     print(f"[i] Records sharing exact duplicate timestamps: {num_duplicates:,}")
 
     if num_duplicates > 0:
-        # Deduplicate keeping maximum step count for each exact timestamp
         df_clean = df.groupby("timestamp", as_index=False).agg({
             "steps": "max",
             "activity_type": "first"
@@ -79,10 +71,9 @@ def analyze_and_deduplicate(df):
 
 
 def resample_steps_to_grid(df, freq="5min"):
-    """
-    Resamples steps to 5-minute grid using sum aggregation.
-    """
-    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    # Strip timezone for clean join with CGM timestamps
+    df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
+    
     df_resampled = df.set_index("timestamp").resample(freq).agg({
         "steps": "sum"
     }).fillna(0).reset_index()
@@ -90,19 +81,24 @@ def resample_steps_to_grid(df, freq="5min"):
 
 
 def merge_steps_with_cgm_hr(cgm_hr_path, resampled_steps):
-    """
-    Performs a clean timestamp-based merge with existing CGM + HR dataset.
-    """
     if not os.path.exists(cgm_hr_path):
         print(f"[!] Target CGM+HR file not found at: {cgm_hr_path}")
         return None
 
     cgm_df = pd.read_csv(cgm_hr_path)
-    cgm_df['timestamp'] = pd.to_datetime(cgm_df['timestamp'], utc=True)
-    resampled_steps['timestamp'] = pd.to_datetime(resampled_steps['timestamp'], utc=True)
+    
+    # Standardize timestamps to naive datetimes on both ends
+    cgm_df['timestamp'] = pd.to_datetime(cgm_df['timestamp']).dt.tz_localize(None)
+    resampled_steps['timestamp'] = pd.to_datetime(resampled_steps['timestamp']).dt.tz_localize(None)
 
-    # Clean 5-min exact grid join
-    merged_df = pd.merge(cgm_df, resampled_steps, on="timestamp", how="left")
+    # Use merge_asof with nearest 5-minute tolerance to guarantee match
+    merged_df = pd.merge_asof(
+        cgm_df.sort_values('timestamp'),
+        resampled_steps.sort_values('timestamp'),
+        on='timestamp',
+        direction='nearest',
+        tolerance=pd.Timedelta('5min')
+    )
     merged_df['steps'] = merged_df['steps'].fillna(0.0)
 
     return merged_df
@@ -112,13 +108,8 @@ if __name__ == "__main__":
     print(f"Parsing activity data from: {ACTIVITY_FILE}\n")
     raw_steps = parse_garmin_activity(ACTIVITY_FILE)
 
-    # 1. Analyze and clean duplicate timestamps
     clean_steps = analyze_and_deduplicate(raw_steps)
-
-    # 2. Resample to 5-minute grid
     resampled_steps = resample_steps_to_grid(clean_steps, freq="5min")
-
-    # 3. Merge onto CGM + HR grid
     merged_dataset = merge_steps_with_cgm_hr(CGM_HR_FILE, resampled_steps)
 
     if merged_dataset is not None:
@@ -128,5 +119,6 @@ if __name__ == "__main__":
         print(f"\n[+] Successfully created merged dataset: {out_path}")
         print(f"    Total rows: {len(merged_dataset):,}")
         print(f"    Columns: {list(merged_dataset.columns)}")
+        print(f"    Matched non-zero step rows: {(merged_dataset['steps'] > 0).sum():,}")
         print("\n--- Sample Active Rows ---")
         print(merged_dataset[merged_dataset['steps'] > 0].head())
