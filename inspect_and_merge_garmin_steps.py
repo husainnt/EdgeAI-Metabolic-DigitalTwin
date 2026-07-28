@@ -1,6 +1,6 @@
 """
-Script to extract Garmin step count data for Patient 1031 from OpenmHealth JSON 
-and align/resample it to a 5-minute CGM time-series grid.
+Script to inspect Garmin activity timestamps for duplicates, perform safe deduplication,
+resample step counts to a 5-minute grid, and merge with patient 1031's CGM + HR dataset.
 """
 
 import os
@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 
 ACTIVITY_FILE = r"F:\FYP\aireadi_data\aireadi-data\d0665d3d-1439-4627-b1c0-e0f2cbed8ebc\dataset\wearable_activity_monitor\physical_activity\garmin_vivosmart5\1031\1031_activity.json"
+CGM_HR_FILE = "results/patient_1031_real_cgm_with_hr.csv"  # Correct path in results/
 
 
 def parse_garmin_activity(json_path):
@@ -31,11 +32,8 @@ def parse_garmin_activity(json_path):
             continue
 
         try:
-            # Extract timestamp from effective_time_frame
             time_interval = item.get("effective_time_frame", {}).get("time_interval", {})
             time_str = time_interval.get("start_date_time") or item.get("effective_time_frame", {}).get("date_time")
-
-            # Extract step count from base_movement_quantity
             movement = item.get("base_movement_quantity", {})
             step_val = movement.get("value", 0)
 
@@ -54,29 +52,81 @@ def parse_garmin_activity(json_path):
     return df
 
 
+def analyze_and_deduplicate(df):
+    """
+    Checks for exact timestamp duplicates and removes redundant overlap records.
+    """
+    total_raw = len(df)
+    duplicate_mask = df.duplicated(subset=["timestamp"], keep=False)
+    num_duplicates = duplicate_mask.sum()
+    
+    print(f"[i] Raw activity records: {total_raw:,}")
+    print(f"[i] Records sharing exact duplicate timestamps: {num_duplicates:,}")
+
+    if num_duplicates > 0:
+        # Deduplicate keeping maximum step count for each exact timestamp
+        df_clean = df.groupby("timestamp", as_index=False).agg({
+            "steps": "max",
+            "activity_type": "first"
+        }).sort_values("timestamp").reset_index(drop=True)
+
+        print(f"[+] Records after deduplication: {len(df_clean):,}")
+        print(f"[+] Step total change: {df['steps'].sum():,.0f} -> {df_clean['steps'].sum():,.0f} steps")
+        return df_clean
+    else:
+        print("[+] No duplicate timestamps detected.")
+        return df
+
+
 def resample_steps_to_grid(df, freq="5min"):
     """
-    Resamples step counts across fixed intervals (5-min windows).
-    Uses sum aggregation to preserve total step volume per window.
+    Resamples steps to 5-minute grid using sum aggregation.
     """
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     df_resampled = df.set_index("timestamp").resample(freq).agg({
         "steps": "sum"
     }).fillna(0).reset_index()
     return df_resampled
 
 
+def merge_steps_with_cgm_hr(cgm_hr_path, resampled_steps):
+    """
+    Performs a clean timestamp-based merge with existing CGM + HR dataset.
+    """
+    if not os.path.exists(cgm_hr_path):
+        print(f"[!] Target CGM+HR file not found at: {cgm_hr_path}")
+        return None
+
+    cgm_df = pd.read_csv(cgm_hr_path)
+    cgm_df['timestamp'] = pd.to_datetime(cgm_df['timestamp'], utc=True)
+    resampled_steps['timestamp'] = pd.to_datetime(resampled_steps['timestamp'], utc=True)
+
+    # Clean 5-min exact grid join
+    merged_df = pd.merge(cgm_df, resampled_steps, on="timestamp", how="left")
+    merged_df['steps'] = merged_df['steps'].fillna(0.0)
+
+    return merged_df
+
+
 if __name__ == "__main__":
-    print(f"Loading and parsing activity data from: {ACTIVITY_FILE}\n")
-    steps_df = parse_garmin_activity(ACTIVITY_FILE)
+    print(f"Parsing activity data from: {ACTIVITY_FILE}\n")
+    raw_steps = parse_garmin_activity(ACTIVITY_FILE)
 
-    print(f"[+] Successfully extracted {len(steps_df):,} raw activity records.")
-    print(f"[+] Total step count across dataset: {steps_df['steps'].sum():,.0f} steps")
+    # 1. Analyze and clean duplicate timestamps
+    clean_steps = analyze_and_deduplicate(raw_steps)
 
-    print("\n--- Non-Zero Step Samples ---")
-    active_samples = steps_df[steps_df["steps"] > 0]
-    print(active_samples.head(10))
+    # 2. Resample to 5-minute grid
+    resampled_steps = resample_steps_to_grid(clean_steps, freq="5min")
 
-    # Resample to 5-minute grid
-    resampled_df = resample_steps_to_grid(steps_df, freq="5min")
-    print(f"\n[+] Resampled into {len(resampled_df):,} 5-minute windows.")
-    print(resampled_df[resampled_df["steps"] > 0].head(10))
+    # 3. Merge onto CGM + HR grid
+    merged_dataset = merge_steps_with_cgm_hr(CGM_HR_FILE, resampled_steps)
+
+    if merged_dataset is not None:
+        out_path = "results/patient_1031_real_cgm_hr_steps.csv"
+        os.makedirs("results", exist_ok=True)
+        merged_dataset.to_csv(out_path, index=False)
+        print(f"\n[+] Successfully created merged dataset: {out_path}")
+        print(f"    Total rows: {len(merged_dataset):,}")
+        print(f"    Columns: {list(merged_dataset.columns)}")
+        print("\n--- Sample Active Rows ---")
+        print(merged_dataset[merged_dataset['steps'] > 0].head())
