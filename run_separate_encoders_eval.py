@@ -1,5 +1,7 @@
 """
 Late-Fusion Separate Stream Encoders + Modal Gating for Patient 1031.
+Matched Training Hyperparameters: 100 Epochs + CosineAnnealingLR Scheduler.
+
 1. Runs independent LSTM stream encoders for HR and Steps to prevent hidden state corruption.
 2. Applies a learned modal gating mechanism to dynamically down-weight steps during sedentary periods.
 3. Evaluates strictly against the 13-state simglucose ODE baseline at the +30-minute forecast horizon.
@@ -9,6 +11,7 @@ import os
 import sys
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -191,18 +194,30 @@ def run_evaluation():
     t_steps_test = torch.tensor(X_steps_test_scaled, dtype=torch.float32)
     t_ctx_test = torch.tensor(X_ctx_test_scaled, dtype=torch.float32)
 
+    # Model Training (Matched Setup: 100 Epochs + CosineAnnealingLR)
     model = GatedSeparateEncoderResidualLSTM(context_dim=2, hidden_dim=32, pred_horizon=PRED_HORIZON)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.003)
+    epochs = 100
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     criterion = nn.MSELoss()
 
     model.train()
-    for epoch in range(50):
+    print("\n" + "="*65)
+    print(" Training Gated Dual-Stream Model (100 Epochs + Cosine Annealing)...")
+    print("="*65)
+    for epoch in range(1, epochs + 1):
         optimizer.zero_grad()
         preds = model(t_hr_train, t_steps_train, t_ctx_train)
         loss = criterion(preds, t_res_train)
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
+        if epoch % 10 == 0:
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Epoch {epoch:03d}/{epochs} | Train MSE Loss: {loss.item():.2f} | LR: {current_lr:.6f}")
+
+    # Evaluate on test set
     model.eval()
     with torch.no_grad():
         predicted_residuals = model(t_hr_test, t_steps_test, t_ctx_test).numpy()
@@ -220,8 +235,8 @@ def run_evaluation():
     pct_reduction = ((mech_rmse - hybrid_rmse) / mech_rmse) * 100
 
     print("\n" + "="*65)
-    print("   LATE-FUSION GATED DUAL-STREAM EVALUATION (+30 MIN HORIZON)   ")
-    print("="*60)
+    print("   MATCHED-TRAINING GATED DUAL-STREAM EVALUATION (+30 MIN HORIZON)")
+    print("="*65)
     print(f"Mechanistic Open-Loop Baseline RMSE: {mech_rmse:.2f} mg/dL  (MAE: {mech_mae:.2f})")
     print(f"Gated Dual-Stream Hybrid RMSE:      {hybrid_rmse:.2f} mg/dL  (MAE: {hybrid_mae:.2f})")
     print(f"Error Reduction over Physics:      {pct_reduction:.2f}%")
