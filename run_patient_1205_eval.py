@@ -1,0 +1,200 @@
+"""
+Cross-Patient Validation Benchmark: Patient 1205.
+Evaluates Standalone HR Residual LSTM against 13-compartment simglucose open-loop physics baseline
+using matched hyperparameters (100 Epochs + CosineAnnealingLR) at +30 min forecast horizon.
+"""
+
+import os
+import torch
+import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+from run_selective_warmstart_simglucose_hybrid import (
+    build_calibrated_t2d_patient,
+    warm_start,
+    simulate_open_loop,
+    T2DPancreaticController
+)
+
+DATASET_PATH = "results/patient_1205_real_cgm_hr.csv"
+WINDOW_SIZE = 12  # 1-hour lookback
+PRED_HORIZON = 6  # 30-min forecast horizon
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+
+class StandaloneHRResidualLSTM(nn.Module):
+    def __init__(self, context_dim=2, hidden_dim=32, pred_horizon=6):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_dim, batch_first=True)
+        self.fc_context = nn.Linear(context_dim, 16)
+        self.fc_out = nn.Sequential(
+            nn.Linear(hidden_dim + 16, 32),
+            nn.ReLU(),
+            nn.Linear(32, pred_horizon)
+        )
+
+    def forward(self, hr_seq, context_x):
+        _, (h_n, _) = self.lstm(hr_seq)
+        h_last = h_n[-1]
+        ctx_emb = torch.relu(self.fc_context(context_x))
+        combined = torch.cat((h_last, ctx_emb), dim=1)
+        return self.fc_out(combined)
+
+
+def extract_2x_daily_calibrations(df, window_tolerance_min=45):
+    # Ensure timezone-naive datetimes for clean arithmetic comparison
+    timestamps_naive = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
+    df['timestamp_naive'] = timestamps_naive
+    dates = timestamps_naive.dt.date.unique()
+    calib_indices = []
+
+    for d in dates:
+        day_df = df[df['timestamp_naive'].dt.date == d]
+        t8 = pd.to_datetime(f"{d} 08:00:00")
+        diffs8 = (day_df['timestamp_naive'] - t8).abs()
+        if not diffs8.empty and diffs8.min() <= pd.Timedelta(minutes=window_tolerance_min):
+            calib_indices.append(diffs8.idxmin())
+            
+        t20 = pd.to_datetime(f"{d} 20:00:00")
+        diffs20 = (day_df['timestamp_naive'] - t20).abs()
+        if not diffs20.empty and diffs20.min() <= pd.Timedelta(minutes=window_tolerance_min):
+            calib_indices.append(diffs20.idxmin())
+
+    return sorted(list(set(calib_indices)))
+
+
+def generate_dataset(df, calib_indices):
+    glucose = df['glucose_mg_dl'].values
+    hr = df['heart_rate'].values
+    num_samples = len(df)
+
+    simglucose_baseline = np.zeros(num_samples)
+    patient = build_calibrated_t2d_patient()
+    params = patient._params
+    basal_rate_correct = params['u2ss'] * params['BW'] / 6000
+    controller = T2DPancreaticController(gb=params['Gb'], basal_rate=basal_rate_correct)
+
+    segments = list(zip(calib_indices[:-1], calib_indices[1:]))
+    if calib_indices[-1] < num_samples:
+        segments.append((calib_indices[-1], num_samples))
+
+    for idx_start, idx_end in segments:
+        calib_val = glucose[idx_start]
+        segment_len = idx_end - idx_start
+        patient.reset()
+        warm_start(patient, calib_val)
+        sim_trace = simulate_open_loop(patient, controller, segment_len)
+        simglucose_baseline[idx_start:idx_end] = sim_trace[:segment_len]
+
+    X_hr, X_ctx, y_res, y_true, y_sim = [], [], [], [], []
+
+    for i in range(WINDOW_SIZE, num_samples - PRED_HORIZON):
+        if simglucose_baseline[i] == 0 or simglucose_baseline[i + PRED_HORIZON - 1] == 0:
+            continue
+
+        hr_seq = hr[i - WINDOW_SIZE : i].reshape(-1, 1)
+        target_true = glucose[i : i + PRED_HORIZON]
+        sim_pred = simglucose_baseline[i : i + PRED_HORIZON]
+        residual = target_true - sim_pred
+
+        past_calibs = [c for c in calib_indices if c <= (i - WINDOW_SIZE)]
+        if not past_calibs:
+            continue
+        last_c = past_calibs[-1]
+        tsc = (i - last_c) * 5
+        calib_val = glucose[last_c]
+
+        X_hr.append(hr_seq)
+        X_ctx.append([tsc, calib_val])
+        y_res.append(residual)
+        y_true.append(target_true)
+        y_sim.append(sim_pred)
+
+    return (np.array(X_hr), np.array(X_ctx), np.array(y_res), 
+            np.array(y_true), np.array(y_sim))
+
+
+def run_evaluation():
+    if not os.path.exists(DATASET_PATH):
+        raise FileNotFoundError(f"Run extract_patient_1205_data.py first to create {DATASET_PATH}")
+
+    df = pd.read_csv(DATASET_PATH)
+    print(f"[+] Loaded dataset with {len(df)} rows for Patient 1205.")
+
+    calib_indices = extract_2x_daily_calibrations(df)
+    X_hr, X_ctx, y_res, y_true, y_sim = generate_dataset(df, calib_indices)
+
+    split = int(len(X_hr) * 0.7)
+    X_hr_train, X_hr_test = X_hr[:split], X_hr[split:]
+    X_ctx_train, X_ctx_test = X_ctx[:split], X_ctx[split:]
+    y_res_train, y_res_test = y_res[:split], y_res[split:]
+    y_true_test, y_sim_test = y_true[split:], y_sim[split:]
+
+    scaler_hr = StandardScaler()
+    X_hr_train_scaled = scaler_hr.fit_transform(X_hr_train.reshape(-1, 1)).reshape(X_hr_train.shape)
+    X_hr_test_scaled = scaler_hr.transform(X_hr_test.reshape(-1, 1)).reshape(X_hr_test.shape)
+
+    scaler_ctx = StandardScaler()
+    X_ctx_train_scaled = scaler_ctx.fit_transform(X_ctx_train)
+    X_ctx_test_scaled = scaler_ctx.transform(X_ctx_test)
+
+    t_hr_train = torch.tensor(X_hr_train_scaled, dtype=torch.float32)
+    t_ctx_train = torch.tensor(X_ctx_train_scaled, dtype=torch.float32)
+    t_res_train = torch.tensor(y_res_train, dtype=torch.float32)
+
+    t_hr_test = torch.tensor(X_hr_test_scaled, dtype=torch.float32)
+    t_ctx_test = torch.tensor(X_ctx_test_scaled, dtype=torch.float32)
+
+    model = StandaloneHRResidualLSTM(context_dim=2, hidden_dim=32, pred_horizon=PRED_HORIZON)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.003)
+    epochs = 100
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    criterion = nn.MSELoss()
+
+    model.train()
+    print("\n" + "="*65)
+    print(" Training Standalone HR Residual Model for Patient 1205 (100 Epochs)...")
+    print("="*65)
+    for epoch in range(1, epochs + 1):
+        optimizer.zero_grad()
+        preds = model(t_hr_train, t_ctx_train)
+        loss = criterion(preds, t_res_train)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        if epoch % 10 == 0:
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Epoch {epoch:03d}/{epochs} | Train MSE Loss: {loss.item():.2f} | LR: {current_lr:.6f}")
+
+    model.eval()
+    with torch.no_grad():
+        predicted_residuals = model(t_hr_test, t_ctx_test).numpy()
+
+    hybrid_preds = y_sim_test + predicted_residuals
+    y_true_30min = y_true_test[:, -1]
+    y_sim_30min = y_sim_test[:, -1]
+    hybrid_30min = hybrid_preds[:, -1]
+
+    mech_rmse = np.sqrt(np.mean((y_true_30min - y_sim_30min) ** 2))
+    hybrid_rmse = np.sqrt(np.mean((y_true_30min - hybrid_30min) ** 2))
+    mech_mae = np.mean(np.abs(y_true_30min - y_sim_30min))
+    hybrid_mae = np.mean(np.abs(y_true_30min - hybrid_30min))
+    pct_reduction = ((mech_rmse - hybrid_rmse) / mech_rmse) * 100
+
+    print("\n" + "="*65)
+    print("   PATIENT 1205 CROSS-PATIENT VALIDATION RESULTS (+30 MIN HORIZON)")
+    print("="*65)
+    print(f"Mechanistic Open-Loop Baseline RMSE: {mech_rmse:.2f} mg/dL  (MAE: {mech_mae:.2f})")
+    print(f"HR-Alone Hybrid Twin RMSE:          {hybrid_rmse:.2f} mg/dL  (MAE: {hybrid_mae:.2f})")
+    print(f"Error Reduction over Physics:        {pct_reduction:.2f}%")
+    print("="*65)
+
+
+if __name__ == "__main__":
+    run_evaluation()
