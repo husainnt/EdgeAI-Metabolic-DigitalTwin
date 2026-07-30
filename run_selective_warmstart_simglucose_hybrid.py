@@ -7,7 +7,8 @@ Selective State Warm-Started simglucose (UVa/Padova T2D) + Garmin HR Hybrid
    - Computes Vg = patient.state[3] / Gb.
    - Warm-starts active glucose & insulin compartments [3, 4, 5, 7, 8, 9, 10, 11, 12] IN-PLACE.
    - Steps patient.step() open-loop using T2DPancreaticController basal policy.
-3. Trains Multimodal Residual LSTM (Garmin HR sequence + calibration context) for 100 epochs.
+3. Includes an explicit Parameter Reset Guard to verify/enforce T2D parameter survival across resets.
+4. Trains Multimodal Residual LSTM (Garmin HR sequence + calibration context) for 100 epochs.
 """
 
 import os
@@ -27,6 +28,7 @@ from simglucose.patient.t1dpatient import T1DPatient, Action as PatientAction
 # Set deterministic random seeds
 torch.manual_seed(42)
 np.random.seed(42)
+
 
 # --- 1. Calibrated T2D Pancreatic Controller ---
 class T2DPancreaticController:
@@ -125,7 +127,7 @@ calibration_indices = sorted(list(calibration_indices))
 print(f"Extracted {len(calibration_indices)} real sparse fingerstick calibration points (~8am/8pm)")
 
 
-# --- 5. Generate Selective Warm-Started simglucose Baseline ---
+# --- 5. Generate Selective Warm-Started simglucose Baseline + PARAMETER RESET GUARD ---
 patient = build_calibrated_t2d_patient()
 params = patient._params
 basal_rate_correct = params['u2ss'] * params['BW'] / 6000
@@ -144,8 +146,38 @@ for k in range(len(calibration_indices)):
     
     g_calib = glucose[idx_start]
     
-    # Warm-start patient state to fingerstick value
+    # Store parameters before reset to verify persistence
+    vmx_before = patient._params['Vmx']
+    kp3_before = patient._params['kp3']
+    
+    # Execute patient reset
     patient.reset()
+    
+    vmx_after = patient._params['Vmx']
+    kp3_after = patient._params['kp3']
+    
+    # Debug Check & Parameter Guard on Segment 0
+    if k == 0:
+        print("\n" + "=" * 65)
+        print(" [DEBUG CHECK] SIMGLUCOSE PATIENT RESET PARAMETER SURVIVAL TEST")
+        print("=" * 65)
+        print(f"  • Vmx BEFORE reset: {vmx_before:.8f}")
+        print(f"  • Vmx AFTER reset:  {vmx_after:.8f}  (Expected: ~0.02348925)")
+        print(f"  • kp3 AFTER reset:  {kp3_after:.8f}  (Expected: ~0.00763000)")
+        if vmx_before == vmx_after and kp3_before == kp3_after:
+            print("  ✓ SUCCESS: Custom T2D parameters survived patient.reset() intact!")
+        else:
+            print("  ❌ CRITICAL WARNING: patient.reset() wiped custom parameters!")
+            print("     Re-applying T2D modifications manually after reset...")
+            patient._params['Vmx'] = vmx_before
+            patient._params['kp3'] = kp3_before
+        print("=" * 65 + "\n")
+    elif vmx_before != vmx_after or kp3_before != kp3_after:
+        # Enforce persistence on subsequent segments if reset wipes them
+        patient._params['Vmx'] = vmx_before
+        patient._params['kp3'] = kp3_before
+
+    # Warm-start patient state to fingerstick value
     warm_start(patient, g_calib)
     
     # Step ODE model forward
