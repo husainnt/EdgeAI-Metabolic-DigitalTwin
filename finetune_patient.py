@@ -32,6 +32,12 @@ MODEL_PATH = "shared_pretrained_backbone.pt"
 NORM_STATS_PATH = "shared_pretrain_norm_stats.npz"
 HELD_OUT_SPLITS_PATH = "held_out_patient_splits.npy"
 
+# Kept in sync with pretrain_shared_backbone.py's EXCLUDE_PATIENT_IDS --
+# 1027 is a known severe outlier (physics RMSE 283.45 mg/dL vs ~30-80 for
+# everyone else), independently reproducing the same flag already set in
+# find_patient_2_candidates.py's EXCLUDE_IDS.
+EXCLUDE_PATIENT_IDS = {"1027"}
+
 torch.manual_seed(42)
 np.random.seed(42)
 
@@ -60,11 +66,29 @@ def normalize(X_hr, X_sleep, tsc, calib_val, stats):
 
 
 def finetune_one_patient(pid, patient_data, stats, finetune_epochs=30):
-    X_hr_tr, X_sleep_tr, X_ctx_tr = normalize(
+    X_hr_tr_full, X_sleep_tr_full, X_ctx_tr_full = normalize(
         patient_data["X_hr_train"], patient_data["X_sleep_train"],
         patient_data["tsc_train"], patient_data["calib_val_train"], stats
     )
-    y_res_tr = patient_data["y_real_train"] - patient_data["y_sim_train"]
+    y_res_tr_full = patient_data["y_real_train"] - patient_data["y_sim_train"]
+
+    # Further split this patient's OWN training portion into sub-train/val
+    # (chronological, 85/15) purely for early stopping -- the held-out test
+    # split is never touched here. This is what was missing before: without
+    # an internal validation signal, fine-tuning had no way to detect
+    # overfitting and just used whatever the final epoch happened to produce.
+    n_tr = len(y_res_tr_full)
+    val_split = int(n_tr * 0.85)
+    if val_split < 10 or (n_tr - val_split) < 5:
+        # Too little data to carve out a meaningful validation set --
+        # fall back to using the full training set with no early stopping.
+        val_split = n_tr
+
+    X_hr_tr, X_sleep_tr, X_ctx_tr = X_hr_tr_full[:val_split], X_sleep_tr_full[:val_split], X_ctx_tr_full[:val_split]
+    y_res_tr = y_res_tr_full[:val_split]
+    X_hr_val, X_sleep_val, X_ctx_val = X_hr_tr_full[val_split:], X_sleep_tr_full[val_split:], X_ctx_tr_full[val_split:]
+    y_res_val = y_res_tr_full[val_split:]
+    has_val = len(y_res_val) > 0
 
     X_hr_te, X_sleep_te, X_ctx_te = normalize(
         patient_data["X_hr"], patient_data["X_sleep"],
@@ -96,7 +120,7 @@ def finetune_one_patient(pid, patient_data, stats, finetune_epochs=30):
         zero_shot_res = model(t_hr_te, t_sleep_te, t_ctx_te).numpy()
     rmse_zero_shot = np.sqrt(np.mean((y_real_te - (y_sim_te + zero_shot_res)) ** 2))
 
-    # --- Fine-tune fusion_head only ---
+    # --- Fine-tune fusion_head only, with validation-based checkpointing ---
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=0.001, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=finetune_epochs, eta_min=1e-5)
@@ -107,8 +131,17 @@ def finetune_one_patient(pid, patient_data, stats, finetune_epochs=30):
         batch_size=16, shuffle=True
     )
 
-    model.train()
+    if has_val:
+        t_hr_val = torch.tensor(X_hr_val, dtype=torch.float32)
+        t_sleep_val = torch.tensor(X_sleep_val, dtype=torch.float32)
+        t_ctx_val = torch.tensor(X_ctx_val, dtype=torch.float32)
+        t_y_val = torch.tensor(y_res_val, dtype=torch.float32)
+
+    best_val_loss = float("inf")
+    best_state = {k: v.clone() for k, v in model.fusion_head.state_dict().items()}
+
     for epoch in range(finetune_epochs):
+        model.train()
         for b_hr, b_sleep, b_ctx, b_y in loader:
             optimizer.zero_grad()
             pred = model(b_hr, b_sleep, b_ctx)
@@ -116,6 +149,19 @@ def finetune_one_patient(pid, patient_data, stats, finetune_epochs=30):
             loss.backward()
             optimizer.step()
         scheduler.step()
+
+        if has_val:
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(t_hr_val, t_sleep_val, t_ctx_val)
+                val_loss = loss_fn(val_pred, t_y_val).item()
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.clone() for k, v in model.fusion_head.state_dict().items()}
+
+    # Restore the best-validation-loss checkpoint (not just the final epoch)
+    if has_val:
+        model.fusion_head.load_state_dict(best_state)
 
     model.eval()
     with torch.no_grad():
@@ -130,6 +176,7 @@ def finetune_one_patient(pid, patient_data, stats, finetune_epochs=30):
         "rmse_finetuned": round(float(rmse_finetuned), 2),
         "mae_finetuned": round(float(mae_finetuned), 2),
         "gain_over_physics_pct": round(float((rmse_physics - rmse_finetuned) / rmse_physics * 100), 2),
+        "used_early_stopping": has_val,
     }
 
 
@@ -140,7 +187,7 @@ def run_finetune_evaluation(patient_ids=None):
     held_out = np.load(HELD_OUT_SPLITS_PATH, allow_pickle=True).item()
 
     if patient_ids is None:
-        patient_ids = list(held_out.keys())
+        patient_ids = [pid for pid in held_out.keys() if pid not in EXCLUDE_PATIENT_IDS]
 
     results = []
     for pid in patient_ids:
@@ -152,7 +199,8 @@ def run_finetune_evaluation(patient_ids=None):
         print(f"Patient {result['patient_id']:>6} | Physics RMSE: {result['rmse_physics']:6.2f} | "
               f"Zero-shot RMSE: {result['rmse_zero_shot']:6.2f} | "
               f"Fine-tuned RMSE: {result['rmse_finetuned']:6.2f} | "
-              f"Gain: {result['gain_over_physics_pct']:+.1f}%")
+              f"Gain: {result['gain_over_physics_pct']:+.1f}% | "
+              f"EarlyStop: {'Y' if result['used_early_stopping'] else 'N (too little data)'}")
 
     if results:
         avg_gain = np.mean([r["gain_over_physics_pct"] for r in results])

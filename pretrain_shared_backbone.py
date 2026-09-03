@@ -48,6 +48,13 @@ HORIZON = 6
 OUTPUT_MODEL_PATH = "shared_pretrained_backbone.pt"
 OUTPUT_NORM_STATS_PATH = "shared_pretrain_norm_stats.npz"
 
+# Patients excluded as known severe outliers. 1027 was already flagged as a
+# "severe outlier" in find_patient_2_candidates.py's EXCLUDE_IDS; this run
+# independently reproduced that signal (physics RMSE 283.45 mg/dL vs
+# ~30-80 mg/dL for every other patient in the smoke test), so the exclusion
+# is kept here too rather than letting one extreme case skew pooled training.
+EXCLUDE_PATIENT_IDS = {"1027"}
+
 # Set to a small number (e.g. 20) for a smoke test before running the full cohort.
 # Set to None to run on the entire extracted cohort.
 LIMIT_PATIENTS = 20
@@ -184,6 +191,10 @@ def build_patient_windows(df, calib_indices, patient):
 
 def run_pretraining():
     csv_files = sorted(glob.glob(os.path.join(COHORT_DIR, "patient_*_merged.csv")))
+    csv_files = [
+        f for f in csv_files
+        if os.path.basename(f).replace("patient_", "").replace("_merged.csv", "") not in EXCLUDE_PATIENT_IDS
+    ]
     if LIMIT_PATIENTS is not None:
         csv_files = csv_files[:LIMIT_PATIENTS]
 
