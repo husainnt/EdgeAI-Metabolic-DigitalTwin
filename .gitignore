@@ -16,4 +16,5 @@ AI-READI-DATA/
 
 # Ignore temporary environment or runner files
 .vscode/
-tempCodeRunnerFile.py
+tempCodeRunnerFile.pytempCodeRunnerFile.py 
+extraction_log.txt 
