@@ -18,3 +18,7 @@ AI-READI-DATA/
 .vscode/
 tempCodeRunnerFile.pytempCodeRunnerFile.py 
 extraction_log.txt 
+results/cohort_windows/ 
+held_out_patient_splits.npy 
+shared_pretrain_norm_stats.npz 
+shared_pretrained_backbone.pt 
