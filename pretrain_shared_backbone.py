@@ -1,33 +1,45 @@
 """
-Shared Backbone Pretraining
-============================
-Pools calibration-window residual samples across the full extracted cohort
-(results/cohort/patient_<pid>_merged.csv) and trains ONE shared HR+Sleep
-residual model -- this is the real answer to the panel's personalization
-objection: population pretraining first, then a small per-patient residual
-head fine-tune (see finetune_patient.py).
+Shared Backbone Pretraining (Parallelized + Resumable)
+========================================================
+Pools calibration-window residual samples across the extracted cohort and
+trains ONE shared HR+Sleep residual model -- the real answer to the
+panel's personalization objection: population pretraining first, then a
+small per-patient residual head fine-tune (see finetune_patient.py).
 
-Methodology matches the validated headline pipeline exactly:
+Methodology is UNCHANGED from the validated headline pipeline:
     - Same T2DPancreaticController / build_calibrated_t2d_patient / warm_start
       / simulate_open_loop from run_selective_warmstart_simglucose_hybrid.py
     - Same LOOKBACK=12 (60 min), HORIZON=6 (30 min) windowing
-    - Single-scalar +30-min-exact target (Methodology Correction #1 --
-      NOT the flawed 6-step vector-target approach)
+    - Single-scalar +30-min-exact target (Methodology Correction #1)
     - Same 2x/day (~8am/8pm, 45-min tolerance) calibration extraction
 
-Split strategy: each patient's own data is split 70/30 chronologically
-(train/test) exactly as before. All patients' TRAIN portions are pooled
-to fit the shared backbone. Each patient's TEST portion is held out
-entirely for the fine-tuning stage's evaluation -- no leakage.
+WHAT'S NEW vs the single-threaded version:
+    1. PARALLELIZED across patients using multiprocessing -- each patient's
+       ODE simulation is completely independent of every other patient's,
+       so this is safe and doesn't change any result, it just does the same
+       work concurrently across CPU cores instead of one at a time. The
+       100-patient timing test showed ~117 sec/patient single-threaded,
+       projecting ~17.5 hours for 538 patients -- impractical without this.
+    2. RESUMABLE via per-patient disk caching (results/cohort_windows/) --
+       if the process is interrupted (as happened once during extraction),
+       re-running this script skips patients whose windows are already
+       cached instead of starting over.
 
-NOTE ON RUNTIME: the simglucose warm-start ODE simulation is the
-expensive part (stepped per 5-min interval per patient). Test on a small
-subset first (see LIMIT_PATIENTS below) before committing to a full
-577-patient run, which may take a long time depending on your machine.
+Split strategy (unchanged): each patient's own data is split 70/30
+chronologically (train/test). All patients' TRAIN portions are pooled to
+fit the shared backbone. Each patient's TEST portion is held out entirely
+for the fine-tuning stage's evaluation -- no leakage.
+
+REQUIRES: run_selective_warmstart_simglucose_hybrid.py must have its
+executable script wrapped in `if __name__ == "__main__":` (see the fixed
+version provided) -- otherwise every worker process will re-run the whole
+single-patient script on import, which is slow and messy at scale.
 """
 
 import os
 import glob
+import time
+import multiprocessing as mp
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -35,29 +47,26 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 import pandas as pd
 
-from run_selective_warmstart_simglucose_hybrid import (
-    build_calibrated_t2d_patient,
-    warm_start,
-    simulate_open_loop,
-    T2DPancreaticController
-)
-
 COHORT_DIR = "results/cohort"
+WINDOWS_CACHE_DIR = "results/cohort_windows"
 LOOKBACK = 12
 HORIZON = 6
 OUTPUT_MODEL_PATH = "shared_pretrained_backbone.pt"
 OUTPUT_NORM_STATS_PATH = "shared_pretrain_norm_stats.npz"
 
 # Patients excluded as known severe outliers. 1027 was already flagged as a
-# "severe outlier" in find_patient_2_candidates.py's EXCLUDE_IDS; this run
-# independently reproduced that signal (physics RMSE 283.45 mg/dL vs
-# ~30-80 mg/dL for every other patient in the smoke test), so the exclusion
-# is kept here too rather than letting one extreme case skew pooled training.
+# "severe outlier" in find_patient_2_candidates.py's EXCLUDE_IDS; the 20/100
+# patient smoke tests independently reproduced that signal (physics RMSE
+# 283.45 mg/dL vs ~30-120 mg/dL for every other patient), so it stays excluded.
 EXCLUDE_PATIENT_IDS = {"1027"}
 
-# Set to a small number (e.g. 20) for a smoke test before running the full cohort.
-# Set to None to run on the entire extracted cohort.
-LIMIT_PATIENTS = 20
+# Set to a number for a smaller test run, or None for the entire cohort.
+LIMIT_PATIENTS = None
+
+# Number of worker processes. None = use all available CPU cores.
+# Set to a specific number (e.g. 4) if you want to leave cores free for
+# other work while this runs.
+NUM_WORKERS = None
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -129,6 +138,10 @@ def build_patient_windows(df, calib_indices, patient):
     Sleep sequence, context (tsc, calib_val), true glucose, sim baseline.
     Matches the corrected (Methodology Correction #1) single-scalar pipeline.
     """
+    from run_selective_warmstart_simglucose_hybrid import (
+        T2DPancreaticController, warm_start, simulate_open_loop
+    )
+
     glucose = df["glucose_mg_dl"].values.astype(np.float32)
     hr = df["heart_rate"].values.astype(np.float32)
     sleep = df["sleep_status"].values.astype(np.float32)
@@ -189,6 +202,48 @@ def build_patient_windows(df, calib_indices, patient):
     }
 
 
+def _cache_path(pid):
+    return os.path.join(WINDOWS_CACHE_DIR, f"patient_{pid}_windows.npz")
+
+
+def _worker_process_patient(csv_path):
+    """
+    Runs in a separate process. Builds windows for one patient (the
+    expensive ODE simulation), caches to disk immediately, and returns
+    (pid, status) -- NOT the full windows array, to keep inter-process
+    communication cheap. The main process re-loads from cache after.
+    """
+    pid = os.path.basename(csv_path).replace("patient_", "").replace("_merged.csv", "")
+    cache_path = _cache_path(pid)
+
+    if os.path.exists(cache_path):
+        return pid, "cached"
+
+    try:
+        # Import here (inside the worker) -- with the __main__ guard fix,
+        # this is now cheap (no side-effecting script execution on import).
+        from run_selective_warmstart_simglucose_hybrid import build_calibrated_t2d_patient
+
+        df = pd.read_csv(csv_path)
+        calib_indices = extract_2x_daily_calibrations(df)
+        patient = build_calibrated_t2d_patient()
+        windows = build_patient_windows(df, calib_indices, patient)
+    except Exception as e:
+        return pid, f"error: {e}"
+
+    if windows is None:
+        return pid, "skipped_insufficient_data"
+
+    os.makedirs(WINDOWS_CACHE_DIR, exist_ok=True)
+    np.savez(
+        cache_path,
+        X_hr=windows["X_hr"], X_sleep=windows["X_sleep"],
+        tsc=windows["tsc"], calib_val=windows["calib_val"],
+        y_real=windows["y_real"], y_sim=windows["y_sim"],
+    )
+    return pid, "ok"
+
+
 def run_pretraining():
     csv_files = sorted(glob.glob(os.path.join(COHORT_DIR, "patient_*_merged.csv")))
     csv_files = [
@@ -198,59 +253,72 @@ def run_pretraining():
     if LIMIT_PATIENTS is not None:
         csv_files = csv_files[:LIMIT_PATIENTS]
 
-    print(f"[+] Building pooled dataset from {len(csv_files)} patients...")
+    os.makedirs(WINDOWS_CACHE_DIR, exist_ok=True)
+    num_workers = NUM_WORKERS or mp.cpu_count()
+
+    print(f"[+] {len(csv_files)} patients to process, using {num_workers} worker processes.")
+    print(f"[+] Cache directory: {WINDOWS_CACHE_DIR}/ (already-cached patients will be skipped)")
+
+    already_cached = sum(1 for f in csv_files if os.path.exists(_cache_path(
+        os.path.basename(f).replace("patient_", "").replace("_merged.csv", "")
+    )))
+    print(f"[+] {already_cached}/{len(csv_files)} already cached from a previous run.")
+
+    start_time = time.time()
+    status_counts = {}
+
+    with mp.Pool(processes=num_workers) as pool:
+        for i, (pid, status) in enumerate(pool.imap_unordered(_worker_process_patient, csv_files)):
+            key = status.split(":")[0]
+            status_counts[key] = status_counts.get(key, 0) + 1
+
+            if (i + 1) % 20 == 0 or (i + 1) == len(csv_files):
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                remaining = (len(csv_files) - (i + 1)) / rate if rate > 0 else 0
+                print(f"    ...processed {i + 1}/{len(csv_files)} | elapsed: {elapsed/60:.1f} min | "
+                      f"est. remaining: {remaining/60:.1f} min | status so far: {status_counts}")
+
+    print(f"\n[+] Parallel window-building complete in {(time.time()-start_time)/60:.1f} minutes.")
+    print(f"[+] Status breakdown: {status_counts}")
+
+    # --- Now pool everything from cache (fast, single-threaded, just disk reads) ---
+    print("\n[+] Loading cached windows and pooling training data...")
 
     pooled_train_hr, pooled_train_sleep, pooled_train_tsc, pooled_train_calib, pooled_train_y_res = [], [], [], [], []
-    held_out_test = {}  # patient_id -> dict of test-split arrays, for later fine-tune eval
+    held_out_test = {}
 
-    skipped = 0
-    for i, csv_path in enumerate(csv_files):
+    for csv_path in csv_files:
         pid = os.path.basename(csv_path).replace("patient_", "").replace("_merged.csv", "")
-        df = pd.read_csv(csv_path)
+        cache_path = _cache_path(pid)
+        if not os.path.exists(cache_path):
+            continue  # errored or skipped during window-building
 
-        try:
-            calib_indices = extract_2x_daily_calibrations(df)
-            patient = build_calibrated_t2d_patient()
-            windows = build_patient_windows(df, calib_indices, patient)
-        except Exception as e:
-            skipped += 1
-            continue
+        data = np.load(cache_path)
+        X_hr, X_sleep = data["X_hr"], data["X_sleep"]
+        tsc, calib_val = data["tsc"], data["calib_val"]
+        y_real, y_sim = data["y_real"], data["y_sim"]
 
-        if windows is None:
-            skipped += 1
-            continue
-
-        n = len(windows["y_real"])
+        n = len(y_real)
         split = int(n * 0.7)
+        y_train_res = y_real[:split] - y_sim[:split]
 
-        y_train_res = windows["y_real"][:split] - windows["y_sim"][:split]
-
-        pooled_train_hr.append(windows["X_hr"][:split])
-        pooled_train_sleep.append(windows["X_sleep"][:split])
-        pooled_train_tsc.append(windows["tsc"][:split])
-        pooled_train_calib.append(windows["calib_val"][:split])
+        pooled_train_hr.append(X_hr[:split])
+        pooled_train_sleep.append(X_sleep[:split])
+        pooled_train_tsc.append(tsc[:split])
+        pooled_train_calib.append(calib_val[:split])
         pooled_train_y_res.append(y_train_res)
 
         held_out_test[pid] = {
-            "X_hr": windows["X_hr"][split:],
-            "X_sleep": windows["X_sleep"][split:],
-            "tsc": windows["tsc"][split:],
-            "calib_val": windows["calib_val"][split:],
-            "y_real": windows["y_real"][split:],
-            "y_sim": windows["y_sim"][split:],
-            # keep train split too, for fine-tuning stage
-            "X_hr_train": windows["X_hr"][:split],
-            "X_sleep_train": windows["X_sleep"][:split],
-            "tsc_train": windows["tsc"][:split],
-            "calib_val_train": windows["calib_val"][:split],
-            "y_real_train": windows["y_real"][:split],
-            "y_sim_train": windows["y_sim"][:split],
+            "X_hr": X_hr[split:], "X_sleep": X_sleep[split:],
+            "tsc": tsc[split:], "calib_val": calib_val[split:],
+            "y_real": y_real[split:], "y_sim": y_sim[split:],
+            "X_hr_train": X_hr[:split], "X_sleep_train": X_sleep[:split],
+            "tsc_train": tsc[:split], "calib_val_train": calib_val[:split],
+            "y_real_train": y_real[:split], "y_sim_train": y_sim[:split],
         }
 
-        if (i + 1) % 10 == 0:
-            print(f"    ...processed {i + 1}/{len(csv_files)} patients (skipped so far: {skipped})")
-
-    print(f"[+] Pooled {len(pooled_train_y_res)} patients into shared training set (skipped {skipped}).")
+    print(f"[+] Pooled {len(pooled_train_y_res)} patients into shared training set.")
 
     X_hr_all = np.concatenate(pooled_train_hr, axis=0)
     X_sleep_all = np.concatenate(pooled_train_sleep, axis=0)
@@ -260,7 +328,6 @@ def run_pretraining():
 
     print(f"[+] Total pooled training windows: {len(y_res_all)}")
 
-    # Global normalization stats (fit on pooled TRAIN data only)
     hr_mean, hr_std = X_hr_all.mean(), X_hr_all.std() + 1e-6
     sleep_mean, sleep_std = X_sleep_all.mean(), X_sleep_all.std() + 1e-6
     tsc_mean, tsc_std = tsc_all.mean(), tsc_all.std() + 1e-6
@@ -288,7 +355,7 @@ def run_pretraining():
 
     model = SharedHRSleepResidualLSTM(hidden_dim=32, context_dim=2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-    epochs = 50  # pooled dataset is much larger than single-patient, fewer epochs needed
+    epochs = 50
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     loss_fn = nn.MSELoss()
 
@@ -310,7 +377,6 @@ def run_pretraining():
     torch.save(model.state_dict(), OUTPUT_MODEL_PATH)
     print(f"\n[+] Shared backbone saved to {OUTPUT_MODEL_PATH}")
 
-    # Save held-out per-patient splits for the fine-tuning stage
     np.save("held_out_patient_splits.npy", held_out_test, allow_pickle=True)
     print(f"[+] Held-out per-patient train/test splits saved to held_out_patient_splits.npy")
     print(f"[+] {len(held_out_test)} patients available for fine-tuning.")
