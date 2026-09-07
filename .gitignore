@@ -1,24 +1,27 @@
-# Ignore the official team deployment folder to prevent nested Git conflicts
-glycemic_twin/
+# Ignore official team deployment folder to prevent nested Git conflicts
 glycemic-twin-edge/
 
-# Ignore massive simulation results and dataset folders (keep GitHub light!)
+# Ignore massive simulation results and dataset folders
 *.csv
+*.tsv
+*.json
 SIM-GLUCOSE/results/
 results/
 AI-READI-DATA/
-*.tsv
-*.json
 
 # Ignore local python cache files
 **/__pycache__/
 **/*.pyc
 
-# Ignore temporary environment or runner files
+# Ignore temporary runner files and logs
 .vscode/
-tempCodeRunnerFile.pytempCodeRunnerFile.py 
-extraction_log.txt 
-results/cohort_windows/ 
-held_out_patient_splits.npy 
-shared_pretrain_norm_stats.npz 
-shared_pretrained_backbone.pt 
+**/tempCodeRunnerFile.py
+extraction_log.txt
+*.log
+*.txt
+
+# Ignore heavy binary model artifacts and caches
+results/cohort_windows/
+held_out_patient_splits.npy
+shared_pretrain_norm_stats.npz
+shared_pretrained_backbone.pt
