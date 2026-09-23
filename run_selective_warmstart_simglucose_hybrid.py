@@ -19,6 +19,14 @@ module for its functions does NOT re-run the whole thing -- this matters a
 lot once this module is imported inside multiprocessing worker processes,
 which would otherwise each re-run the full script on Windows (spawn-based
 multiprocessing re-imports modules fresh in every worker).
+
+CHANGED 2026-09: warm_start() no longer rescales insulin-related
+compartments by the exact same ratio as glucose -- see the function's own
+docstring for the full diagnostic trail that led to this fix. This changes
+every physics-RMSE-dependent result across the whole project (headline
+single-patient numbers, six-encoder architecture, and the 537-patient
+population pipeline all import this same function) -- re-validation is
+required project-wide, not just for the 27 patients that surfaced the bug.
 """
 
 import os
@@ -70,19 +78,52 @@ def get_Vg(patient):
     return patient.state[3] / patient._params['Gb']
 
 
-def warm_start(patient, target_bg):
+def warm_start(patient, target_bg, insulin_damping: float = 0.4):
     """
-    Proportionally rescales active glucose and insulin compartments
-    [3, 4, 5, 7, 8, 9, 10, 11, 12] in-place to match target_bg,
-    keeping meal compartments [0, 1, 2] and insulin deviation [6] at 0.
+    Rescales glucose compartments [3, 4] FULLY to match target_bg, same as
+    before. Insulin-related compartments [5, 7, 8, 9, 10, 11, 12] are now
+    rescaled by a DAMPENED version of the same ratio (insulin_damping < 1.0)
+    instead of the full glucose-implied ratio.
+
+    WHY (found + fixed 2026-09, see fyp-experiment-log for full diagnostic
+    trail): the original full-ratio rescale of ALL compartments (including
+    insulin) was found to produce a non-physiological transient whenever a
+    patient's real calibration reading is far from the model's default
+    resting equilibrium (confirmed constant at ~138.6 mg/dL across every
+    patient.reset()). Scaling insulin down alongside a low glucose reading
+    (or up alongside a high one) weakens/strengthens insulin's suppression
+    of hepatic glucose output by the same proportion, causing the simulated
+    trajectory to overshoot toward a spurious extreme and then relax back
+    toward ~140-150 mg/dL over the segment -- independent of what the real
+    patient is actually doing. Confirmed empirically via real-vs-sim
+    diagnostic plots (Patients 7188, 7392, 7751) and a targeted scale-factor
+    check that ruled out "one anomalous calibration reading" as the cause
+    (the scale factor itself was unremarkable at the worst-error segments,
+    pointing to the systematic every-segment mechanism instead).
+
+    Dampening is a disclosed, HEURISTIC engineering choice, not a
+    rigorously-derived physiological correction -- it reduces the artifact
+    without claiming to solve the deeper problem of initializing 13 coupled
+    compartments from a single fingerstick reading. A more rigorous fix
+    would need patient-specific insulin secretion/resistance parameters
+    (see the Visentin et al. 2020 Future Work citation already in this
+    project's notes). insulin_damping=0.4 is a starting value, not a tuned
+    optimum -- worth sensitivity-checking against a range if time allows.
     """
     Vg = get_Vg(patient)
     current_bg = patient.state[3] / Vg
-    scale = target_bg / current_bg
+    glucose_scale = target_bg / current_bg
+    # Here I compute a dampened insulin scale -- moves only partway toward
+    # the glucose-implied ratio instead of matching it exactly
+    insulin_scale = 1.0 + insulin_damping * (glucose_scale - 1.0)
 
-    # Mutate numpy array elements in-place (bypasses read-only property getter)
-    for i in [3, 4, 5, 7, 8, 9, 10, 11, 12]:
-        patient.state[i] *= scale
+    # Here I apply the full scale to the glucose compartments only
+    for i in [3, 4]:
+        patient.state[i] *= glucose_scale
+
+    # Here I apply the dampened scale to insulin-related compartments
+    for i in [5, 7, 8, 9, 10, 11, 12]:
+        patient.state[i] *= insulin_scale
 
 
 def simulate_open_loop(patient, controller, n_steps_5min):
@@ -206,13 +247,13 @@ def _run_single_patient_1031_script():
             print("\n" + "=" * 65)
             print(" [DEBUG CHECK] SIMGLUCOSE PATIENT RESET PARAMETER SURVIVAL TEST")
             print("=" * 65)
-            print(f"  • Vmx BEFORE reset: {vmx_before:.8f}")
-            print(f"  • Vmx AFTER reset:  {vmx_after:.8f}  (Expected: ~0.02348925)")
-            print(f"  • kp3 AFTER reset:  {kp3_after:.8f}  (Expected: ~0.00763000)")
+            print(f"  \u2022 Vmx BEFORE reset: {vmx_before:.8f}")
+            print(f"  \u2022 Vmx AFTER reset:  {vmx_after:.8f}  (Expected: ~0.02348925)")
+            print(f"  \u2022 kp3 AFTER reset:  {kp3_after:.8f}  (Expected: ~0.00763000)")
             if vmx_before == vmx_after and kp3_before == kp3_after:
-                print("  ✓ SUCCESS: Custom T2D parameters survived patient.reset() intact!")
+                print("  \u2713 SUCCESS: Custom T2D parameters survived patient.reset() intact!")
             else:
-                print("  ❌ CRITICAL WARNING: patient.reset() wiped custom parameters!")
+                print("  \u274c CRITICAL WARNING: patient.reset() wiped custom parameters!")
                 print("     Re-applying T2D modifications manually after reset...")
                 patient._params['Vmx'] = vmx_before
                 patient._params['kp3'] = kp3_before
@@ -234,7 +275,7 @@ def _run_single_patient_1031_script():
         calib_val_series[i] = glucose[0]
         time_since_calib_series[i] = (i * 5.0) / 60.0
 
-    print(f"✓ Warm-started simglucose simulation complete! Baseline Mean: {sim_baseline.mean():.1f} mg/dL")
+    print(f"\u2713 Warm-started simglucose simulation complete! Baseline Mean: {sim_baseline.mean():.1f} mg/dL")
 
     LOOKBACK = 12
     HORIZON = 6
@@ -324,9 +365,9 @@ def _run_single_patient_1031_script():
     print("=" * 85)
     print(f"SELECTIVE WARM-START SIMGLUCOSE HYBRID RESULTS: Patient 1031 ({actual_days:.1f} Days)")
     print("=" * 85)
-    print(f"  • simglucose T2D Baseline RMSE: {rmse_sim:.2f} mg/dL | MAE: {mae_sim:.2f} mg/dL")
-    print(f"  • True Hybrid Twin RMSE:        {rmse_hybrid:.2f} mg/dL | MAE: {mae_hybrid:.2f} mg/dL")
-    print(f"  • Improvement over Physics:    {improvement_pct:+.1f}%")
+    print(f"  \u2022 simglucose T2D Baseline RMSE: {rmse_sim:.2f} mg/dL | MAE: {mae_sim:.2f} mg/dL")
+    print(f"  \u2022 True Hybrid Twin RMSE:        {rmse_hybrid:.2f} mg/dL | MAE: {mae_hybrid:.2f} mg/dL")
+    print(f"  \u2022 Improvement over Physics:    {improvement_pct:+.1f}%")
     print("=" * 85)
 
     os.makedirs("results", exist_ok=True)
