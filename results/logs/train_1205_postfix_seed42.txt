@@ -1,0 +1,40 @@
+C:\Users\hussain tahir\AppData\Local\Programs\Python\Python313\Lib\site-packages\gym\envs\registration.py:2: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+Executing training on device: cpu
+Random seed: 42
+Loading patient data with validated simglucose T2D engine from: results/patient_1205_real_cgm_hr_sleep.csv
+
+Starting Training Loop (Six-Encoder Architecture, Real HR+Sleep+Calibration Context)...
+=================================================================
+Epoch 01/15 | Train Loss: 679.0422 | Val MAE: 11.84 mg/dL | Val RMSE: 15.33 mg/dL
+Epoch 02/15 | Train Loss: 649.4830 | Val MAE: 11.78 mg/dL | Val RMSE: 15.27 mg/dL
+Epoch 03/15 | Train Loss: 633.5316 | Val MAE: 13.76 mg/dL | Val RMSE: 17.50 mg/dL
+Epoch 04/15 | Train Loss: 621.0595 | Val MAE: 13.53 mg/dL | Val RMSE: 17.26 mg/dL
+Epoch 05/15 | Train Loss: 608.5461 | Val MAE: 10.42 mg/dL | Val RMSE: 13.66 mg/dL
+Epoch 06/15 | Train Loss: 606.3719 | Val MAE: 12.89 mg/dL | Val RMSE: 16.59 mg/dL
+Epoch 07/15 | Train Loss: 589.6163 | Val MAE: 10.39 mg/dL | Val RMSE: 13.68 mg/dL
+Epoch 08/15 | Train Loss: 570.7723 | Val MAE: 12.27 mg/dL | Val RMSE: 15.94 mg/dL
+Epoch 09/15 | Train Loss: 552.4058 | Val MAE: 12.41 mg/dL | Val RMSE: 16.13 mg/dL
+Epoch 10/15 | Train Loss: 520.7379 | Val MAE: 10.75 mg/dL | Val RMSE: 14.29 mg/dL
+Epoch 11/15 | Train Loss: 497.4630 | Val MAE: 10.83 mg/dL | Val RMSE: 14.44 mg/dL
+Epoch 12/15 | Train Loss: 469.8095 | Val MAE: 12.22 mg/dL | Val RMSE: 15.95 mg/dL
+Epoch 13/15 | Train Loss: 453.6727 | Val MAE: 9.79 mg/dL | Val RMSE: 13.32 mg/dL
+Epoch 14/15 | Train Loss: 417.3864 | Val MAE: 9.97 mg/dL | Val RMSE: 13.57 mg/dL
+Epoch 15/15 | Train Loss: 404.5118 | Val MAE: 8.24 mg/dL | Val RMSE: 11.34 mg/dL
+=================================================================
+Model Training Complete!
+[+] Best-checkpoint model saved to results/hybrid_twin_1205_postfix_seed42.pt (val RMSE: 11.34 mg/dL)
+
+=================================================================
+SIX-ENCODER HYBRID TWIN FINAL RESULTS (patient_1205_real_cgm_hr_sleep.csv)
+=================================================================
+  - simglucose Physics-Only Baseline RMSE: 18.36 mg/dL | MAE: 15.45 mg/dL
+  - Six-Encoder Hybrid Twin RMSE:           11.34 mg/dL | MAE: 8.24 mg/dL
+  - Improvement over Physics:                +38.2%
+=================================================================
+
+NOTE: modality status is determined by real column presence in the
+loaded CSV, not hardcoded -- check window_generator.py's has_hr/has_act/
+has_sleep/has_spo2 for this specific run's actual data coverage.
+Diet remains masked off (no data exists anywhere in this project's
+pipeline for it).
