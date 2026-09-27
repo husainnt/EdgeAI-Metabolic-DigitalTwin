@@ -1,0 +1,99 @@
+{
+  "args": {
+    "cache_dir": "results/six_encoder_cache",
+    "out_dir": "/content/drive/MyDrive/FYP/results/six_encoder_population",
+    "run_name": "curriculum",
+    "train_config": "curriculum",
+    "epochs": 25,
+    "batch_size": 256,
+    "lr": 0.001,
+    "p_levels": 0.5,
+    "max_patients": 0,
+    "keep_precalib": false,
+    "seed": 42,
+    "smoke": false
+  },
+  "n_test_patients": 88,
+  "n_test_windows": 235883,
+  "results": {
+    "Context-only": {
+      "rmse": 47.91231093146186,
+      "mae": 31.206413902079305,
+      "physics_rmse": 72.42665160096645,
+      "pct_vs_physics": 33.84712688992718,
+      "frac_patients_better_than_physics": 0.9886363636363636
+    },
+    "+ HR only": {
+      "rmse": 47.870918047402874,
+      "mae": 31.18760909018902,
+      "physics_rmse": 72.42665160096645,
+      "pct_vs_physics": 33.9042783433549,
+      "frac_patients_better_than_physics": 0.9886363636363636
+    },
+    "+ Sleep only": {
+      "rmse": 47.782168958608835,
+      "mae": 31.136720485674886,
+      "physics_rmse": 72.42665160096645,
+      "pct_vs_physics": 34.026814850058265,
+      "frac_patients_better_than_physics": 0.9886363636363636
+    },
+    "+ SpO2 only": {
+      "rmse": 47.89208215471008,
+      "mae": 31.207273718279623,
+      "physics_rmse": 72.42665160096645,
+      "pct_vs_physics": 33.875056907820635,
+      "frac_patients_better_than_physics": 0.9886363636363636
+    },
+    "+ Activity only": {
+      "rmse": 47.76608463885837,
+      "mae": 31.10249159835936,
+      "physics_rmse": 72.42665160096645,
+      "pct_vs_physics": 34.049022586292,
+      "frac_patients_better_than_physics": 0.9886363636363636
+    },
+    "+ ALL real": {
+      "rmse": 47.712983507121486,
+      "mae": 31.0608333580644,
+      "physics_rmse": 72.42665160096645,
+      "pct_vs_physics": 34.122339701695104,
+      "frac_patients_better_than_physics": 0.9886363636363636
+    }
+  },
+  "contributions": {
+    "+ HR only": {
+      "n": 88,
+      "mean": -0.04992633804465854,
+      "se": 0.07971630320325324,
+      "frac_improved": 0.5681818181818182,
+      "verdict": "not distinguishable from zero"
+    },
+    "+ Sleep only": {
+      "n": 88,
+      "mean": -0.13273287543935536,
+      "se": 0.05909854087439034,
+      "frac_improved": 0.625,
+      "verdict": "IMPROVES (mean below 0 by more than 2 SE)"
+    },
+    "+ SpO2 only": {
+      "n": 69,
+      "mean": -0.01781449907185578,
+      "se": 0.03105466283994407,
+      "frac_improved": 0.5652173913043478,
+      "verdict": "not distinguishable from zero"
+    },
+    "+ Activity only": {
+      "n": 88,
+      "mean": -0.15537004307954055,
+      "se": 0.07351726656030422,
+      "frac_improved": 0.6136363636363636,
+      "verdict": "IMPROVES (mean below 0 by more than 2 SE)"
+    },
+    "+ ALL real": {
+      "n": 88,
+      "mean": -0.2382636114640289,
+      "se": 0.10979691692478646,
+      "frac_improved": 0.6136363636363636,
+      "verdict": "IMPROVES (mean below 0 by more than 2 SE)"
+    }
+  }
+}

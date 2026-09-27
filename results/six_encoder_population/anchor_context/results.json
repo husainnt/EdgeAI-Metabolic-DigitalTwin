@@ -1,0 +1,28 @@
+{
+  "args": {
+    "cache_dir": "results/six_encoder_cache",
+    "out_dir": "/content/drive/MyDrive/FYP/results/six_encoder_population",
+    "run_name": "anchor_context",
+    "train_config": "context",
+    "epochs": 25,
+    "batch_size": 256,
+    "lr": 0.001,
+    "p_levels": 0.5,
+    "max_patients": 0,
+    "keep_precalib": false,
+    "seed": 42,
+    "smoke": false
+  },
+  "n_test_patients": 88,
+  "n_test_windows": 235883,
+  "results": {
+    "Context-only": {
+      "rmse": 47.897406189693875,
+      "mae": 31.175508513417288,
+      "physics_rmse": 72.42665160096645,
+      "pct_vs_physics": 33.86770597433675,
+      "frac_patients_better_than_physics": 0.9886363636363636
+    }
+  },
+  "contributions": {}
+}
