@@ -249,7 +249,7 @@ def _run_single_patient_1031_script():
             print("=" * 65)
             print(f"  \u2022 Vmx BEFORE reset: {vmx_before:.8f}")
             print(f"  \u2022 Vmx AFTER reset:  {vmx_after:.8f}  (Expected: ~0.02348925)")
-            print(f"  \u2022 kp3 AFTER reset:  {kp3_after:.8f}  (Expected: ~0.00763000)")
+            print(f"  \u2022 kp3 AFTER reset:  {kp3_after:.8f}  (Expected: ~0.00845600)")
             if vmx_before == vmx_after and kp3_before == kp3_after:
                 print("  \u2713 SUCCESS: Custom T2D parameters survived patient.reset() intact!")
             else:
