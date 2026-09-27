@@ -87,7 +87,20 @@ def extract_diet_features(pid: int):
             capped_any |= over_cap
 
     if "Amount Consumed" in df.columns:
-        amount_frac = (df["Amount Consumed"].fillna(100) / 100.0)
+        raw_amount = df["Amount Consumed"].fillna(100)
+        # Here I clip Amount Consumed at 100% -- it is documented as "percentage
+        # of the logged meal consumed", which cannot exceed 100% by definition
+        # (you cannot eat more than one logged meal entry). A value above 100 is
+        # a data-entry artifact, same class of problem as an implausible macro
+        # value, and is capped + flagged the same way, not trusted as a real
+        # multiplier that would otherwise silently inflate Carbs_eaten etc.
+        over_100 = has_meal_row & (raw_amount > 100)
+        n_over_100 = int(over_100.sum())
+        if n_over_100:
+            print(f"[!] Subject {pid}: {n_over_100} meal(s) had Amount Consumed above 100% "
+                  f"-- capping to 100%. Example raw values: {raw_amount[over_100].round(1).tolist()[:5]}")
+        amount_frac = (raw_amount.clip(upper=100) / 100.0)
+        capped_any = capped_any | over_100
     else:
         print(f"[!] Subject {pid}: 'Amount Consumed' column not found. Real columns: {df.columns.tolist()}")
         print(f"    Defaulting to 100% consumed for this patient -- FLAG THIS in your report as a")

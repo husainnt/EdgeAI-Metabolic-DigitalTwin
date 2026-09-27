@@ -160,8 +160,23 @@ def postprandial_gate_report(df, glucose_col="Dexcom GL", window_hours=3):
         return None
     rmse_aware = np.sqrt(aware_sq / n)
     rmse_blind = np.sqrt(blind_sq / n)
+
+    # Here I also compute WHOLE-RECORD meal-blind RMSE (from the first
+    # calibration point onward, same exclusion as window_generator.py's
+    # pre-calibration handling elsewhere in this project) as a diagnostic --
+    # this isolates whether a poor postprandial number is a meal-injection
+    # problem specifically, or a calibration-anchor/baseline-fit problem
+    # that would show up even with no meals involved at all.
+    start = calib_idx[0]
+    valid_all = np.isfinite(real[start:]) & np.isfinite(blind[start:])
+    whole_record_rmse_blind = float(np.sqrt(np.mean((blind[start:][valid_all] - real[start:][valid_all]) ** 2)))
+
     verdict = "PASSES gate (meal-aware beats meal-blind)" if rmse_aware < rmse_blind else "FAILS gate"
     print(f"Postprandial ({window_hours}h) RMSE -- meal-blind: {rmse_blind:.2f} | "
           f"meal-aware: {rmse_aware:.2f} | n_meals: {len(onset_rows)} | n_points: {n} | {verdict}")
+    print(f"  [diagnostic] whole-record meal-blind physics RMSE: {whole_record_rmse_blind:.2f} mg/dL "
+          f"(compare to AI-READI's ~47-72 mg/dL median -- if this is far higher, the calibration-anchor "
+          f"approach itself may be a poor fit for this dataset, independent of meal-awareness)")
     return {"rmse_blind": rmse_blind, "rmse_aware": rmse_aware, "n_meals": len(onset_rows),
-            "n_points": int(n), "passes": bool(rmse_aware < rmse_blind)}
+            "n_points": int(n), "passes": bool(rmse_aware < rmse_blind),
+            "whole_record_rmse_blind": whole_record_rmse_blind}
