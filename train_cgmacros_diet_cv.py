@@ -10,8 +10,10 @@ one fixed modality configuration each (same method as the anchor runs):
     context   : calibration context only            [HR 0, Act 0, Sleep 0, SpO2 0, Diet 0, Ctx 1]
     ctx_wear  : HR + Activity + context (no diet)    [1, 1, 0, 0, 0, 1]
     full      : HR + Activity + Diet + context       [1, 1, 0, 0, 1, 1]
+    ctx_diet  : Diet + context only (no HR/Activity) [0, 0, 0, 0, 1, 1]   (optional arm)
 so the diet effect is the paired contrast  full - ctx_wear  (per held-out
 subject, postprandial windows), and nothing else changes between the two arms.
+ctx_diet - context isolates Diet from the HR/Activity encoders entirely.
 
 Training baseline = MEAL-BLIND physics (mech_fore / mech_curr in the cache).
 The meal-aware physics is read only to print a reference column.
@@ -28,8 +30,11 @@ statistics are fitted on the TRAINING subjects of each fold only, never on the
 held-out subject. Diet features: macros -> log1p, time-since-meal clipped at
 --tsm-clip-min and converted to hours, has_had_meal left as 0/1.
 
-No epoch selection on the held-out subject: every arm trains for a fixed
---epochs. Results are saved per fold, so a stopped run resumes where it left off.
+No epoch selection on the held-out subject. By default every arm trains for a fixed
+--epochs. With --inner-val K, K TRAINING subjects are set aside inside each fold and
+used only to pick the best epoch (early stopping, postprandial RMSE) for each arm,
+the same rule for every arm; the held-out subject is never used for selection.
+Results are saved per fold, so a stopped run resumes where it left off.
 
 Usage (from D:\\FYP\\CODE):
     # code-path check (numbers are NOT meaningful)
@@ -40,6 +45,9 @@ Usage (from D:\\FYP\\CODE):
 
     # same, with the three broken-baseline subjects kept out of TRAINING (still evaluated)
     python train_cgmacros_diet_cv.py --run-name cv_no_broken_train --exclude-train 39,47,49
+
+    # nested early stopping plus the diet-only arm
+    python train_cgmacros_diet_cv.py --run-name cv_es --exclude-train 39,47,49 --inner-val 2 --arms context,ctx_wear,full,ctx_diet
 """
 
 import os
@@ -47,6 +55,7 @@ import sys
 import glob
 import json
 import time
+import hashlib
 import argparse
 import numpy as np
 
@@ -58,6 +67,7 @@ ARMS = {
     "context":  [0, 0, 0, 0, 0, 1],
     "ctx_wear": [1, 1, 0, 0, 0, 1],
     "full":     [1, 1, 0, 0, 1, 1],
+    "ctx_diet": [0, 0, 0, 0, 1, 1],
 }
 POSTPRANDIAL_MIN = 180  # same 3 h window the gate and the builder use
 
@@ -65,6 +75,7 @@ POSTPRANDIAL_MIN = 180  # same 3 h window the gate and the builder use
 CONTRASTS = [
     ("DIET effect        (full - ctx_wear)", "full", "ctx_wear"),
     ("wearable effect    (ctx_wear - context)", "ctx_wear", "context"),
+    ("DIET-ONLY effect  (ctx_diet - context)", "ctx_diet", "context"),
     ("full vs context    (full - context)", "full", "context"),
     ("full vs physics    (full - phys_blind)", "full", "phys_blind"),
     ("ctx_wear vs physics (ctx_wear - phys_blind)", "ctx_wear", "phys_blind"),
@@ -253,7 +264,7 @@ def make_inputs(dims, T, idx, mask):
     }
 
 
-def train_arm(model, dims, T, tr_idx, arm_mask, args, device, tag):
+def train_arm(model, dims, T, tr_idx, arm_mask, args, device, tag, val=None):
     import torch
     import torch.nn as nn
     new_params = list(model.enc_activity.parameters()) + list(model.enc_diet.parameters())
@@ -265,6 +276,7 @@ def train_arm(model, dims, T, tr_idx, arm_mask, args, device, tag):
     crit = nn.MSELoss()
     pat = torch.tensor(arm_mask, dtype=torch.float32, device=device)
     last = float("nan")
+    best_score, best_state, best_epoch = float("inf"), None, args.epochs
     for epoch in range(1, args.epochs + 1):
         model.train()
         perm = tr_idx[torch.randperm(len(tr_idx), device=device)]
@@ -281,9 +293,22 @@ def train_arm(model, dims, T, tr_idx, arm_mask, args, device, tag):
             opt.step()
             total += loss.detach() * len(b)
         last = float(total) / len(perm)
-        if epoch == 1 or epoch == args.epochs or epoch % 5 == 0:
-            print(f"      [{tag}] epoch {epoch:02d}/{args.epochs} train MSE {last:.1f}", flush=True)
-    return last
+        msg = ""
+        if val is not None:
+            # Here I score the INNER validation subjects (never the held-out subject) on their
+            # postprandial windows, the same rule for every arm, and keep the best epoch
+            pv = predict(model, dims, T, val["idx"], arm_mask, 4096, device)
+            sel = val["pp"] if val["pp"].any() else np.ones(len(pv), dtype=bool)
+            score = rmse(pv[sel], val["y"][sel])
+            if score < best_score:
+                best_score, best_epoch = score, epoch
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            msg = f" | inner-val pp RMSE {score:.2f}{' *' if best_epoch == epoch else ''}"
+        if epoch == 1 or epoch == args.epochs or epoch % 5 == 0 or (val is not None and best_epoch == epoch):
+            print(f"      [{tag}] epoch {epoch:02d}/{args.epochs} train MSE {last:.1f}{msg}", flush=True)
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return last, best_epoch
 
 
 def predict(model, dims, T, idx, pattern, batch_size, device):
@@ -326,6 +351,8 @@ def main():
                     help="subjects whose meal-blind physics RMSE (clean windows) is at or below this are 'calibrated'")
     ap.add_argument("--drop-subjects", default="", help="comma-separated subject IDs removed from everything")
     ap.add_argument("--exclude-train", default="", help="comma-separated subject IDs never used for TRAINING (still evaluated)")
+    ap.add_argument("--inner-val", type=int, default=0,
+                    help="number of TRAINING subjects held out inside each fold for early stopping (0 = fixed epochs)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--force", action="store_true", help="recompute folds that already have results")
     ap.add_argument("--smoke", action="store_true", help="2 folds, 2 epochs, 20 steps per epoch: code-path check only")
@@ -362,7 +389,7 @@ def main():
     run_dir = os.path.join(args.out_dir, args.run_name + ("_smoke" if args.smoke else ""))
     os.makedirs(run_dir, exist_ok=True)
     keep_keys = ("arms", "epochs", "batch_size", "lr_backbone", "lr_new", "activity_init", "residual_bound",
-                 "tsm_clip_min", "drop_subjects", "exclude_train", "seed", "init_ckpt")
+                 "tsm_clip_min", "drop_subjects", "exclude_train", "seed", "init_ckpt", "inner_val")
     sig = {k: getattr(args, k) for k in keep_keys}
     # Here I record the subject list too: adding a subject changes every fold's training set,
     # so old fold results must not be silently reused
@@ -401,11 +428,19 @@ def main():
             print(f"[i] fold {pid}: already done, skipping")
             continue
         te_np = np.where(D["pid"] == pid)[0]
-        tr_np = np.where((D["pid"] != pid) & ~np.isin(D["pid"], list(excl_train)))[0]
+        eligible = [p for p in subjects if p != pid and p not in excl_train]
+        # Here I pick the inner-validation subjects by a hash of (subject, fold), so the choice is
+        # deterministic, differs between folds, and never touches the held-out subject
+        inner = sorted(eligible, key=lambda p: hashlib.md5(f"{p}|{pid}".encode()).hexdigest())[:args.inner_val]
+        if args.inner_val and len(eligible) - len(inner) < 2:
+            raise SystemExit(f"[!] fold {pid}: --inner-val {args.inner_val} leaves too few training subjects")
+        tr_np = np.where(np.isin(D["pid"], [p for p in eligible if p not in inner]))[0]
+        va_np = np.where(np.isin(D["pid"], inner))[0]
         if len(tr_np) == 0:
             raise SystemExit(f"[!] fold {pid}: no training windows left (check --exclude-train)")
+        extra = f" + inner-val {sorted(inner)}" if inner else ""
         print(f"\n=== fold {fold + 1}/{len(fold_subjects)}: hold out subject {pid} "
-              f"({len(te_np)} windows) | train on {len(np.unique(D['pid'][tr_np]))} subjects, {len(tr_np)} windows ===", flush=True)
+              f"({len(te_np)} windows) | train on {len(np.unique(D['pid'][tr_np]))} subjects, {len(tr_np)} windows{extra} ===", flush=True)
 
         train_mask = np.zeros(len(D["y"]), dtype=bool)
         train_mask[tr_np] = True
@@ -418,6 +453,9 @@ def main():
         T["y"] = torch.from_numpy(D["y"]).unsqueeze(-1).to(device)
         tr_idx = torch.from_numpy(tr_np).long().to(device)
         te_idx = torch.from_numpy(te_np).long().to(device)
+        val = None
+        if len(va_np):
+            val = {"idx": torch.from_numpy(va_np).long().to(device), "y": D["y"][va_np], "pp": pp_all[va_np]}
 
         save = {"pid": np.array(pid), "y": D["y"][te_np], "mech_fore": D["mech_fore"][te_np],
                 "mech_fore_aware": D["mech_fore_aware"][te_np], "tsm_target_min": D["tsm_target_min"][te_np],
@@ -426,13 +464,14 @@ def main():
         for a_i, arm in enumerate(arms):
             t0 = time.time()
             model, dims = init_model(device, args, ckpt, seed=args.seed + 1000 * fold + a_i)
-            last = train_arm(model, dims, T, tr_idx, ARMS[arm], args, device, f"{pid}/{arm}")
+            last, best_ep = train_arm(model, dims, T, tr_idx, ARMS[arm], args, device, f"{pid}/{arm}", val)
             pred = predict(model, dims, T, te_idx, ARMS[arm], 4096, device)
             save[f"pred_{arm}"] = pred
+            save[f"best_epoch_{arm}"] = np.array(best_ep)
             # Here I print the held-out RMSE for monitoring only; it never selects an epoch or a setting
             print(f"    {arm:<9} held-out RMSE all {rmse(pred, save['y']):6.2f} | postprandial "
                   f"{rmse(pred[pp], save['y'][pp]):6.2f} | physics {rmse(save['mech_fore'], save['y']):6.2f} "
-                  f"| {time.time() - t0:.0f}s", flush=True)
+                  f"| best epoch {best_ep} | {time.time() - t0:.0f}s", flush=True)
         np.savez_compressed(fold_path, **save)
         el = (time.time() - t_start) / 60
         print(f"  [saved] {fold_path} | elapsed {el:.1f} min", flush=True)
