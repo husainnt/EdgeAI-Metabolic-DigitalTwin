@@ -11,6 +11,9 @@ one fixed modality configuration each (same method as the anchor runs):
     ctx_wear  : HR + Activity + context (no diet)    [1, 1, 0, 0, 0, 1]
     full      : HR + Activity + Diet + context       [1, 1, 0, 0, 1, 1]
     ctx_diet  : Diet + context only (no HR/Activity) [0, 0, 0, 0, 1, 1]   (optional arm)
+    ctx_timing: same as ctx_diet but the five macros are blanked: meal TIMING only (optional control)
+    ctx_shuf  : same as ctx_diet but each meal's macros are swapped with another meal of the
+                same subject, timing kept (optional control: should lose the gain if macros matter)
 so the diet effect is the paired contrast  full - ctx_wear  (per held-out
 subject, postprandial windows), and nothing else changes between the two arms.
 ctx_diet - context isolates Diet from the HR/Activity encoders entirely.
@@ -68,7 +71,11 @@ ARMS = {
     "ctx_wear": [1, 1, 0, 0, 0, 1],
     "full":     [1, 1, 0, 0, 1, 1],
     "ctx_diet": [0, 0, 0, 0, 1, 1],
+    "ctx_timing": [0, 0, 0, 0, 1, 1],
+    "ctx_shuf": [0, 0, 0, 0, 1, 1],
 }
+# Here I map the control arms to the modified diet tensors they read (everything else reads the real one)
+ARM_DIET_KEY = {"ctx_timing": "diet_timing", "ctx_shuf": "diet_shuf"}
 POSTPRANDIAL_MIN = 180  # same 3 h window the gate and the builder use
 
 # (label, arm_a, arm_b): the paired difference is RMSE(arm_a) - RMSE(arm_b); negative = arm_a better
@@ -76,6 +83,9 @@ CONTRASTS = [
     ("DIET effect        (full - ctx_wear)", "full", "ctx_wear"),
     ("wearable effect    (ctx_wear - context)", "ctx_wear", "context"),
     ("DIET-ONLY effect  (ctx_diet - context)", "ctx_diet", "context"),
+    ("meal CONTENT effect (ctx_diet - ctx_timing)", "ctx_diet", "ctx_timing"),
+    ("SHUFFLE control    (ctx_diet - ctx_shuf)", "ctx_diet", "ctx_shuf"),
+    ("meal TIMING effect (ctx_timing - context)", "ctx_timing", "context"),
     ("full vs context    (full - context)", "full", "context"),
     ("full vs physics    (full - phys_blind)", "full", "phys_blind"),
     ("ctx_wear vs physics (ctx_wear - phys_blind)", "ctx_wear", "phys_blind"),
@@ -90,7 +100,7 @@ def load_cache(cache_dir, drop_subjects):
     # Here I skip the builder's temp files so a run started mid-build never reads a half-written file
     files = sorted(f for f in glob.glob(os.path.join(cache_dir, "subject_*.npz")) if not f.endswith(".tmp.npz"))
     keys = ("hr", "act", "glc", "diet", "mech_curr", "mech_fore", "mech_fore_aware", "y",
-            "tsm_target_min", "target_row")
+            "tsm_target_min", "target_row", "curr_row")
     cols = {k: [] for k in keys + ("has", "pid")}
     empty = []
     for f in files:
@@ -158,6 +168,30 @@ def apply_norm(D, diet_t, st):
     dz[:, :6] = (dz[:, :6] - np.array(st["diet_mean"], dtype=np.float32)) / np.array(st["diet_std"], dtype=np.float32)
     out["diet"] = dz
     return {k: v.astype(np.float32) for k, v in out.items()}
+
+
+def shuffle_meal_macros(dz, pid, curr_row, tsm_min, has_meal, seed):
+    """Control for the Diet encoder: within each subject, swap the five macro features between
+    MEALS (windows of the same meal share one macro vector), keeping every timing feature."""
+    out = dz.copy()
+    rng = np.random.default_rng(seed)
+    # Here I recover each window's meal onset row from its row and minutes-since-meal, so all
+    # windows of one meal move together and the shuffle happens at meal level
+    onset = curr_row.astype(np.int64) - np.rint(tsm_min).astype(np.int64)
+    for p in np.unique(pid):
+        rows = np.where((pid == p) & (has_meal == 1))[0]
+        if len(rows) == 0:
+            continue
+        uniq, first_idx, inv = np.unique(onset[rows], return_index=True, return_inverse=True)
+        if len(uniq) < 2:
+            continue
+        macros = dz[rows[first_idx], :5]
+        # Here I use a random CYCLE, so every meal gets another meal's macros and none keeps its own
+        order = rng.permutation(len(uniq))
+        perm = np.empty(len(uniq), dtype=np.int64)
+        perm[order] = np.roll(order, 1)
+        out[rows, :5] = macros[perm][inv]
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -249,7 +283,7 @@ def init_model(device, args, ckpt, seed):
     return model, dims
 
 
-def make_inputs(dims, T, idx, mask):
+def make_inputs(dims, T, idx, mask, diet_key="diet"):
     """mask: (B,6) float [HR, Act, Sleep, SpO2, Diet, Context]. Availability flags gate HR and Activity."""
     import torch
     B = idx.numel()
@@ -265,12 +299,12 @@ def make_inputs(dims, T, idx, mask):
         "activity": {"data": T["act"][idx], "mask": mask[:, 1] * has[:, 1]},
         "sleep": {"data": zeros_seq, "mask": zeros_b},   # CGMacros has no sleep stream: always off
         "spo2": {"data": zeros_seq, "mask": zeros_b},    # CGMacros has no SpO2 stream: always off
-        "diet": {"data": T["diet"][idx], "mask": mask[:, 4]},
+        "diet": {"data": T[diet_key][idx], "mask": mask[:, 4]},
         "glucose": {"data": T["glc"][idx], "mask": mask[:, 5]},
     }
 
 
-def train_arm(model, dims, T, tr_idx, arm_mask, args, device, tag, val=None):
+def train_arm(model, dims, T, tr_idx, arm_mask, args, device, tag, val=None, diet_key="diet"):
     import torch
     import torch.nn as nn
     new_params = list(model.enc_activity.parameters()) + list(model.enc_diet.parameters())
@@ -292,7 +326,7 @@ def train_arm(model, dims, T, tr_idx, arm_mask, args, device, tag, val=None):
         for i in range(0, len(perm), args.batch_size):
             b = perm[i:i + args.batch_size]
             mask = pat.unsqueeze(0).repeat(len(b), 1)
-            y_pred, _ = model(make_inputs(dims, T, b, mask), T["mech_curr"][b], T["mech_fore"][b])
+            y_pred, _ = model(make_inputs(dims, T, b, mask, diet_key), T["mech_curr"][b], T["mech_fore"][b])
             loss = crit(y_pred, T["y"][b])
             opt.zero_grad()
             loss.backward()
@@ -303,7 +337,7 @@ def train_arm(model, dims, T, tr_idx, arm_mask, args, device, tag, val=None):
         if val is not None:
             # Here I score the INNER validation subjects (never the held-out subject) on their
             # postprandial windows, the same rule for every arm, and keep the best epoch
-            pv = predict(model, dims, T, val["idx"], arm_mask, 4096, device)
+            pv = predict(model, dims, T, val["idx"], arm_mask, 4096, device, diet_key)
             sel = val["pp"] if val["pp"].any() else np.ones(len(pv), dtype=bool)
             score = rmse(pv[sel], val["y"][sel])
             if score < best_score:
@@ -317,7 +351,7 @@ def train_arm(model, dims, T, tr_idx, arm_mask, args, device, tag, val=None):
     return last, best_epoch
 
 
-def predict(model, dims, T, idx, pattern, batch_size, device):
+def predict(model, dims, T, idx, pattern, batch_size, device, diet_key="diet"):
     import torch
     model.eval()
     pat = torch.tensor(pattern, dtype=torch.float32, device=device)
@@ -326,7 +360,7 @@ def predict(model, dims, T, idx, pattern, batch_size, device):
         for i in range(0, len(idx), batch_size):
             b = idx[i:i + batch_size]
             mask = pat.unsqueeze(0).repeat(len(b), 1)
-            y_pred, _ = model(make_inputs(dims, T, b, mask), T["mech_curr"][b], T["mech_fore"][b])
+            y_pred, _ = model(make_inputs(dims, T, b, mask, diet_key), T["mech_curr"][b], T["mech_fore"][b])
             out.append(y_pred.squeeze(-1))
     return torch.cat(out).cpu().numpy()
 
@@ -453,6 +487,13 @@ def main():
         stats = fit_fold_stats(D, diet_t, train_mask, src_stats)
         Xn = apply_norm(D, diet_t, stats)
         T = {k: torch.from_numpy(v).to(device) for k, v in Xn.items()}
+        if "ctx_timing" in arms:
+            dt = Xn["diet"].copy()
+            dt[:, :5] = 0.0   # normalised 0 = the training-set mean macro, i.e. no meal-content information
+            T["diet_timing"] = torch.from_numpy(dt).to(device)
+        if "ctx_shuf" in arms:
+            T["diet_shuf"] = torch.from_numpy(shuffle_meal_macros(
+                Xn["diet"], D["pid"], D["curr_row"], D["diet"][:, 5], D["diet"][:, 6], args.seed + pid)).to(device)
         T["has"] = torch.from_numpy(D["has"]).to(device)
         T["mech_curr"] = torch.from_numpy(D["mech_curr"]).unsqueeze(-1).to(device)
         T["mech_fore"] = torch.from_numpy(D["mech_fore"]).unsqueeze(-1).to(device)
@@ -470,8 +511,9 @@ def main():
         for a_i, arm in enumerate(arms):
             t0 = time.time()
             model, dims = init_model(device, args, ckpt, seed=args.seed + 1000 * fold + a_i)
-            last, best_ep = train_arm(model, dims, T, tr_idx, ARMS[arm], args, device, f"{pid}/{arm}", val)
-            pred = predict(model, dims, T, te_idx, ARMS[arm], 4096, device)
+            dk = ARM_DIET_KEY.get(arm, "diet")
+            last, best_ep = train_arm(model, dims, T, tr_idx, ARMS[arm], args, device, f"{pid}/{arm}", val, dk)
+            pred = predict(model, dims, T, te_idx, ARMS[arm], 4096, device, dk)
             save[f"pred_{arm}"] = pred
             save[f"best_epoch_{arm}"] = np.array(best_ep)
             # Here I print the held-out RMSE for monitoring only; it never selects an epoch or a setting
