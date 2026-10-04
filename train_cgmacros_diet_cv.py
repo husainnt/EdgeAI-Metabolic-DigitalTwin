@@ -130,8 +130,14 @@ def fit_fold_stats(D, diet_t, train_mask, src_stats):
         st["hr"] = ms(D["hr"][train_mask])
         st["glc_tsc_hours"] = ms(D["glc"][train_mask][:, 0])
         st["glc_calib_mgdl"] = ms(D["glc"][train_mask][:, 1])
-    st["act_mets"] = ms(D["act"][train_mask][..., 0])
-    st["act_cal"] = ms(D["act"][train_mask][..., 1])
+    # Here I fit Activity statistics only on training windows that really HAVE an Activity stream;
+    # subjects without one carry zeros in the cache, and including them would drag the mean and std
+    act_ok = train_mask & (D["has"][:, 1] == 1)
+    if act_ok.any():
+        st["act_mets"] = ms(D["act"][act_ok][..., 0])
+        st["act_cal"] = ms(D["act"][act_ok][..., 1])
+    else:
+        st["act_mets"], st["act_cal"] = [0.0, 1.0], [0.0, 1.0]
     st["diet_mean"] = [float(x) for x in diet_t[train_mask][:, :6].mean(axis=0)]
     st["diet_std"] = [max(float(x), 1e-3) for x in diet_t[train_mask][:, :6].std(axis=0)]
     return st

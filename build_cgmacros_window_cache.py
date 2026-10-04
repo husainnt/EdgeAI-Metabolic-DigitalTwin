@@ -96,7 +96,7 @@ STATUS_FIELDS = [
     "n_clean", "n_postprandial_clean", "n_dropped_nonfinite",
     "phys_blind_rmse_clean", "phys_aware_rmse_clean",
     "phys_blind_rmse_pp", "phys_aware_rmse_pp",
-    "has_hr", "has_act", "disabled_modalities", "seconds", "error",
+    "has_hr", "has_act", "disabled_modalities", "nonfinite_breakdown", "seconds", "error",
 ]
 
 
@@ -218,20 +218,33 @@ def sanitize(arrays, has):
     with any non-finite model input are DROPPED and counted, never zero-filled."""
     disabled = []
     for k in ("hr", "act"):
-        if has[k] and not np.isfinite(arrays[k]).any():
-            arrays[k] = np.zeros_like(arrays[k])
+        a = arrays[k]
+        # Here I switch a modality OFF when ANY of its channels is non-finite everywhere. A
+        # half-missing Activity modality (e.g. a subject with no METs column but a calories
+        # column) used to survive this check and then drop every window downstream
+        chans = a.reshape(a.shape[0], a.shape[1], -1) if a.ndim == 3 else a.reshape(a.shape[0], a.shape[1], 1)
+        dead = [c for c in range(chans.shape[2]) if not np.isfinite(chans[:, :, c]).any()]
+        if has[k] and dead:
+            arrays[k] = np.zeros_like(a)
             has[k] = 0.0
             disabled.append(k)
     n = len(arrays["y"])
     keep = np.ones(n, dtype=bool)
+    # Here I count, per array, how many windows are non-finite, so a subject
+    # that loses windows says WHICH input caused it instead of just a total
+    breakdown = {}
     for k in ("hr", "act", "glc", "diet"):
-        keep &= np.isfinite(arrays[k].reshape(n, -1)).all(axis=1)
+        ok = np.isfinite(arrays[k].reshape(n, -1)).all(axis=1)
+        breakdown[k] = int((~ok).sum())
+        keep &= ok
     for k in ("mech_curr", "mech_fore", "y"):
-        keep &= np.isfinite(arrays[k])
+        ok = np.isfinite(arrays[k])
+        breakdown[k] = int((~ok).sum())
+        keep &= ok
     n_dropped = int((~keep).sum())
     if n_dropped:
         arrays = {k: v[keep] for k, v in arrays.items()}
-    return arrays, has, n_dropped, disabled
+    return arrays, has, n_dropped, disabled, breakdown
 
 
 def process_subject(task):
@@ -266,9 +279,18 @@ def process_subject(task):
 
         arrays, has = build_windows(df, glucose, sim_blind, sim_aware, calib_idx)
         status["n_windows"] = len(arrays["y"])
-        arrays, has, n_dropped, disabled = sanitize(arrays, has)
+        arrays, has, n_dropped, disabled, breakdown = sanitize(arrays, has)
         status["n_dropped_nonfinite"] = n_dropped
         status["disabled_modalities"] = ";".join(disabled)
+        status["nonfinite_breakdown"] = ";".join(f"{k}:{v}" for k, v in breakdown.items() if v)
+
+        # Here I refuse to write an empty cache and call it ok: a subject with
+        # zero usable windows must be loud in build_status.csv and must be
+        # retried by the resume check on the next run
+        if len(arrays["y"]) == 0:
+            status["status"] = "error_no_windows_after_sanitize"
+            status["error"] = f"all {status['n_windows']} windows had a non-finite input: {status['nonfinite_breakdown']}"
+            return status
         status["has_hr"], status["has_act"] = int(has["hr"]), int(has["act"])
 
         clean = ~(arrays["pre_calib"] | arrays["anchor_in_horizon"])
