@@ -36,6 +36,9 @@ Usage:
     # method as the single-patient context-only controls
     python pretrain_six_encoder_population.py --train-config context --run-name anchor_context
     python pretrain_six_encoder_population.py --train-config all --run-name anchor_all
+
+    # base ablation: the model corrects the anchor-decay forecast instead of simglucose
+    python pretrain_six_encoder_population.py --base anchor --train-config all --run-name B_s42
 """
 
 import os
@@ -82,7 +85,11 @@ LEVEL_MASKS = [
 # ----------------------------------------------------------------------------
 # Data loading (numpy only)
 # ----------------------------------------------------------------------------
-def load_cache(cache_dir, max_patients=0, keep_precalib=False):
+# Here I count windows dropped by the min-tsc filter, so main() can print it without changing load_cache's return value
+FRESH_DROPPED = {"n": 0}
+
+
+def load_cache(cache_dir, max_patients=0, keep_precalib=False, min_tsc_hours=0.0):
     """Stacks every cached patient's train + later windows into flat arrays."""
     # Here I skip the builder's temp files (patient_<id>.npz.tmp.npz) so a run started while the
     # cache is still being built never tries to read a half-written file
@@ -103,8 +110,14 @@ def load_cache(cache_dir, max_patients=0, keep_precalib=False):
                 if n == 0:
                     continue
                 keep = np.ones(n, dtype=bool) if keep_precalib else ~d[f"{split}_pre_calib"]
+                n_precalib_dropped += n - int(keep.sum())
+                if min_tsc_hours > 0:
+                    # Here I drop windows whose calibration falls AFTER the forecast origin: the cache stores the
+                    # calibration state at the target time, so tsc < horizon (0.5 h) means the anchor is a future reading
+                    fresh = d[f"{split}_glc"][:, 0] < min_tsc_hours
+                    FRESH_DROPPED["n"] += int((fresh & keep).sum())
+                    keep = keep & ~fresh
                 n_keep = int(keep.sum())
-                n_precalib_dropped += n - n_keep
                 if n_keep == 0:
                     continue
                 for k in keys:
@@ -204,11 +217,77 @@ def paired_stats(diff):
 
 
 # ----------------------------------------------------------------------------
+# Anchor-decay base and simple baselines (numpy only)
+# ----------------------------------------------------------------------------
+HORIZON_H = 0.5  # the cache forecasts 6 steps x 5 min = 30 min ahead
+
+
+def fit_anchor_decay(D, train_mask, tau_hours=0.0):
+    """Here I fit the anchor-decay forecast on TRAIN windows only: y_hat = ybar + (calib - ybar) * exp(-age / tau)."""
+    y_tr = D["y"][train_mask].astype(np.float64)
+    ybar = float(y_tr.mean())
+    calib = D["glc"][train_mask][:, 1].astype(np.float64)
+    tsc = D["glc"][train_mask][:, 0].astype(np.float64)
+    if tau_hours and tau_hours > 0:
+        return ybar, float(tau_hours)
+    best_tau, best_err = None, float("inf")
+    for tau in (0.5, 1, 2, 3, 4, 6, 8, 12, 24, 48, 96):
+        pred = ybar + (calib - ybar) * np.exp(-tsc / tau)
+        err = float(np.sqrt(np.mean((pred - y_tr) ** 2)))
+        if err < best_err:
+            best_tau, best_err = float(tau), err
+    return ybar, best_tau
+
+
+def anchor_forecasts(D, ybar, tau):
+    """Here I build the anchor-decay base. The cache stores hours-since-calibration at the TARGET time, so the forecast
+    decays over tsc, and the 'current' value decays over tsc - 0.5 h (the age at the forecast origin)."""
+    calib = D["glc"][:, 1].astype(np.float64)
+    tsc = D["glc"][:, 0].astype(np.float64)
+    fore = ybar + (calib - ybar) * np.exp(-tsc / tau)
+    curr = ybar + (calib - ybar) * np.exp(-np.maximum(tsc - HORIZON_H, 0.0) / tau)
+    return curr.astype(np.float32), fore.astype(np.float32)
+
+
+def ridge_fit_predict(F_tr, y_tr, F_te, alpha=1.0):
+    """Here I fit closed-form ridge on standardized features (train statistics only) and predict the test windows."""
+    mu, sd = F_tr.mean(axis=0), F_tr.std(axis=0) + 1e-9
+    A = np.hstack([(F_tr - mu) / sd, np.ones((len(F_tr), 1))]).astype(np.float64)
+    reg = alpha * np.eye(A.shape[1])
+    reg[-1, -1] = 0.0  # Here I do not penalize the intercept
+    beta = np.linalg.solve(A.T @ A + reg, A.T @ y_tr.astype(np.float64))
+    B = np.hstack([(F_te - mu) / sd, np.ones((len(F_te), 1))]).astype(np.float64)
+    return (B @ beta).astype(np.float32)
+
+
+# ----------------------------------------------------------------------------
 # Model I/O (torch)
 # ----------------------------------------------------------------------------
-def build_model(device):
+class ConcatMLPFusion(nn.Module):
+    """Here I replace the Transformer with a plain concat + MLP so only the fusion differs (encoders stay LSTM/MLP).
+    Same call signature as CrossModalTransformerFusion: (tokens [B,6,d], availability [B,6]) -> [B,d]."""
+
+    def __init__(self, num_modalities=6, d_model=64):
+        super().__init__()
+        # Here I keep a learned token for offline sensors, like the Transformer version does
+        self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.net = nn.Sequential(
+            nn.Linear(num_modalities * d_model, 128), nn.ReLU(), nn.Dropout(0.1), nn.Linear(128, d_model), nn.LayerNorm(d_model))
+
+    def forward(self, tokens, availability):
+        # Here I swap offline modalities for the mask token, then flatten and mix all tokens at once
+        avail = availability.unsqueeze(-1)
+        tokens = torch.where(avail == 1, tokens, self.mask_token.expand_as(tokens))
+        return self.net(tokens.flatten(1))
+
+
+def build_model(device, residual_bound=80.0, fusion="transformer"):
     from hybrid_twin import HybridResidualTwin  # imported here so numpy helpers stay importable without the model code
-    model = HybridResidualTwin().to(device)
+    # Here I pass the residual cap through to BoundedResidualHead (the old hard-coded value was 80.0)
+    model = HybridResidualTwin(max_residual_bound=residual_bound)
+    if fusion == "concat":
+        model.fusion = ConcatMLPFusion(num_modalities=6, d_model=64)
+    model = model.to(device)
     # Here I read the real encoder input sizes so a wrong shape fails loudly instead of silently tiling
     dims = {
         "hr": model.enc_hr.lstm.input_size,
@@ -288,6 +367,16 @@ def main():
     ap.add_argument("--p-levels", type=float, default=0.5, help="share of windows using the 5-level curriculum (rest: independent dropout)")
     ap.add_argument("--max-patients", type=int, default=0)
     ap.add_argument("--keep-precalib", action="store_true")
+    ap.add_argument("--min-tsc-hours", type=float, default=0.5,
+                    help="drop windows whose calibration is younger than this at the target time (0.5 h = horizon, removes future-anchor windows); use 0 to reproduce the old results")
+    ap.add_argument("--residual-bound", type=float, default=80.0,
+                    help="max |residual| in mg/dL added to the physics forecast (80 reproduces the old results)")
+    ap.add_argument("--fusion", choices=["transformer", "concat"], default="transformer",
+                    help="'concat' = no Transformer: encoders -> concat -> MLP (the fair 'LSTM only' comparison)")
+    ap.add_argument("--base", choices=["physics", "anchor"], default="physics",
+                    help="forecast the residual is added to: 'physics' = simglucose (old default), 'anchor' = anchor-decay from the last calibration")
+    ap.add_argument("--anchor-tau", type=float, default=0.0,
+                    help="decay time constant in hours for --base anchor (0 = fit on train windows)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--smoke", action="store_true", help="2 epochs of 20 steps; if a split is empty, reuse all windows (code-path test only)")
     args = ap.parse_args()
@@ -302,8 +391,9 @@ def main():
     print(f"Device: {device} | run dir: {run_dir}")
 
     # ---- data ----
-    D, n_pre, n_files = load_cache(args.cache_dir, args.max_patients, args.keep_precalib)
+    D, n_pre, n_files = load_cache(args.cache_dir, args.max_patients, args.keep_precalib, args.min_tsc_hours)
     N = len(D["y"])
+    print(f"[+] min-tsc-hours {args.min_tsc_hours}: dropped {FRESH_DROPPED['n']} windows whose calibration postdates the forecast origin")
     print(f"[+] Loaded {n_files} patient files, {N} windows "
           f"({'kept' if args.keep_precalib else 'dropped'} {n_pre} pre-calibration windows)")
 
@@ -330,6 +420,17 @@ def main():
           f"HR {D['has'][tr_np, 0].mean():.2f}, Activity {D['has'][tr_np, 1].mean():.2f}, "
           f"Sleep {D['has'][tr_np, 2].mean():.2f}, SpO2 {D['has'][tr_np, 3].mean():.2f}")
 
+    # Here I keep the simglucose forecasts for reporting, then (for --base anchor) replace what the model adds its residual to
+    D["phys_curr"] = D["mech_curr"].copy()
+    D["phys_fore"] = D["mech_fore"].copy()
+    ybar, tau = fit_anchor_decay(D, train_mask, args.anchor_tau)
+    anc_curr_all, anc_fore_all = anchor_forecasts(D, ybar, tau)
+    print(f"[+] Anchor-decay fit on train windows: ybar {ybar:.2f} mg/dL, tau {tau:g} h")
+    if args.base == "anchor":
+        D["mech_curr"], D["mech_fore"] = anc_curr_all, anc_fore_all
+    print(f"[+] Base forecast the model corrects: {args.base} | RMSE on val {rmse_mae(D['mech_fore'][va_np], D['y'][va_np])[0]:.2f}, "
+          f"test {rmse_mae(D['mech_fore'][te_np], D['y'][te_np])[0]:.2f} mg/dL")
+
     T = {k: torch.from_numpy(v).to(device) for k, v in Xn.items()}
     T["has"] = torch.from_numpy(D["has"]).to(device)
     T["mech_curr"] = torch.from_numpy(D["mech_curr"]).unsqueeze(-1).to(device)
@@ -339,7 +440,8 @@ def main():
     y_np = D["y"]
 
     # ---- model ----
-    model, dims = build_model(device)
+    model, dims = build_model(device, args.residual_bound, args.fusion)
+    print(f"[+] Model: fusion={args.fusion} | residual bound +/-{args.residual_bound} mg/dL")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     criterion = nn.MSELoss()
 
@@ -405,8 +507,9 @@ def main():
 
     pid_te = D["pid"][te_np]
     y_te = y_np[te_np]
-    phys_te = D["mech_fore"][te_np]
+    phys_te = D["phys_fore"][te_np]
     phys_rmse, phys_mae = rmse_mae(phys_te, y_te)
+    base_rmse, _ = rmse_mae(D["mech_fore"][te_np], y_te)
     up_te, phys_pp = per_patient_rmse(phys_te, y_te, pid_te)
     _, has_pp = per_patient_has(D["has"][te_np], pid_te)
 
@@ -421,11 +524,36 @@ def main():
         rmse, mae = rmse_mae(pred, y_te)
         _, pp = per_patient_rmse(pred, y_te, pid_te)
         pp_rmse[name] = pp
-        results[name] = {"rmse": rmse, "mae": mae, "physics_rmse": phys_rmse,
+        results[name] = {"rmse": rmse, "mae": mae, "physics_rmse": phys_rmse, "base": args.base, "base_rmse": base_rmse,
+                         "pct_vs_base": (base_rmse - rmse) / base_rmse * 100,
                          "pct_vs_physics": (phys_rmse - rmse) / phys_rmse * 100,
                          "frac_patients_better_than_physics": float(np.mean(pp < phys_pp))}
         print(f"{name:<18} | {rmse:>7.2f} | {mae:>7.2f} | {phys_rmse:>12.2f} | {results[name]['pct_vs_physics']:>+9.1f}% | "
               f"{results[name]['frac_patients_better_than_physics'] * 100:>27.0f}%")
+
+    # Here I score simple baselines on the SAME test windows, fit on train patients only
+    F_ap = np.column_stack([D["glc"][:, 1], D["glc"][:, 0], D["phys_fore"], D["phys_curr"]])
+    wear = np.column_stack([Xn["hr"].mean(axis=1), Xn["act"][..., 0].mean(axis=1), Xn["sleep"].mean(axis=1), Xn["spo2"].mean(axis=1)])
+    F_all = np.hstack([F_ap, wear])
+    baselines_te = {
+        "train_mean": np.full(len(te_np), ybar, dtype=np.float32),
+        "physics": phys_te,
+        "hold_last_calibration": D["glc"][te_np][:, 1],
+        "anchor_decay": anc_fore_all[te_np],
+        "ridge_anchor_physics": ridge_fit_predict(F_ap[tr_np], y_np[tr_np], F_ap[te_np]),
+        "ridge_all": ridge_fit_predict(F_all[tr_np], y_np[tr_np], F_all[te_np]),
+    }
+    base_pp, baseline_results = {}, {}
+    print("\n" + "=" * 86)
+    print(f"BASELINES on the same {len(te_np)} test windows (fit on train patients only)")
+    print("=" * 86)
+    print(f"{'Baseline':<24} | {'RMSE':>7} | {'MAE':>7} | {'median patient RMSE':>20}")
+    for bname, bpred in baselines_te.items():
+        b_rmse, b_mae = rmse_mae(bpred, y_te)
+        _, b_pp = per_patient_rmse(bpred, y_te, pid_te)
+        base_pp[bname] = b_pp
+        baseline_results[bname] = {"rmse": b_rmse, "mae": b_mae, "median_patient_rmse": float(np.median(b_pp))}
+        print(f"{bname:<24} | {b_rmse:>7.2f} | {b_mae:>7.2f} | {np.median(b_pp):>20.2f}")
 
     contributions = {}
     if fixed_name is None:
@@ -442,14 +570,18 @@ def main():
             print(f"  {name:<16}: {s['mean']:+.2f} mg/dL (SE {s['se']:.2f}, n={s['n']} patients, "
                   f"{s['frac_improved'] * 100:.0f}% of patients improved) -- {s['verdict']}")
 
-    pd_rows = ["patient_id,physics_rmse," + ",".join(f'"{n}"' for n in pp_rmse) + ",has_hr,has_act,has_sleep,has_spo2"]
+    # Here I append the baseline columns AFTER the original ones so older readers of this CSV keep working
+    pd_rows = ["patient_id,physics_rmse," + ",".join(f'"{n}"' for n in pp_rmse) + ",has_hr,has_act,has_sleep,has_spo2,"
+               + ",".join(f"base_{n}" for n in base_pp)]
     for i, p in enumerate(up_te):
-        pd_rows.append(f"{p},{phys_pp[i]:.3f}," + ",".join(f"{pp_rmse[n][i]:.3f}" for n in pp_rmse) + "," + ",".join(str(int(x)) for x in has_pp[i]))
+        pd_rows.append(f"{p},{phys_pp[i]:.3f}," + ",".join(f"{pp_rmse[n][i]:.3f}" for n in pp_rmse) + "," + ",".join(str(int(x)) for x in has_pp[i])
+                       + "," + ",".join(f"{base_pp[n][i]:.3f}" for n in base_pp))
     with open(os.path.join(run_dir, "per_patient_test.csv"), "w") as f:
         f.write("\n".join(pd_rows))
     with open(os.path.join(run_dir, "results.json"), "w") as f:
         json.dump({"args": vars(args), "n_test_patients": int(len(up_te)), "n_test_windows": int(len(te_np)),
-                   "results": results, "contributions": contributions}, f, indent=2)
+                   "results": results, "baselines": baseline_results, "anchor_fit": {"ybar": ybar, "tau_hours": tau},
+                   "contributions": contributions}, f, indent=2)
     print(f"\n[SAVED] {run_dir}: best_model.pt, norm_stats.json, results.json, per_patient_test.csv")
 
 
